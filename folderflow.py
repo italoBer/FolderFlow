@@ -41,7 +41,7 @@ DEFAULT_CONFIG = {
     "ml_list_dev_id":        "",
     "watcher_interval":      60,
     # Auto-update via GitHub Releases (formato: "usuario/FolderFlow")
-    "github_repo":           "",
+    "github_repo":           "italoBer/FolderFlow",
 }
 
 MESES = [
