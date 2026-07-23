@@ -1,0 +1,26 @@
+# Dados locais — NUNCA subir (contêm credenciais e dados de clientes)
+folderflow_config.json
+folderflow_index.json
+
+# Build do PyInstaller
+build/
+dist/
+*.spec
+
+# Python
+__pycache__/
+*.pyc
+
+# Diversos
+*.bat.tmp
+_folderflow_update.bat
+
+# Arquivos locais de teste / legado (não fazem parte do projeto)
+demo.html
+index.html
+css/
+js/
+Shopee 2026/
+flag_config.json
+flag_index.json
+.claude/
