@@ -16,6 +16,7 @@ import unicodedata
 import time
 import uuid
 import string
+import tempfile
 import datetime
 import threading
 import subprocess
@@ -225,15 +226,15 @@ def _read_config_file(path):
 def load_config():
     """Lê a config. Se o arquivo estiver corrompido, tenta o backup antes de
     cair no padrão — nunca descarta os grupos do usuário em silêncio."""
-    cfg = DEFAULT_CONFIG.copy()
+    raw = None
     CONFIG_LOAD_WARNING.clear()
     if os.path.exists(CONFIG_FILE):
         try:
-            cfg = {**DEFAULT_CONFIG, **_read_config_file(CONFIG_FILE)}
+            raw = _read_config_file(CONFIG_FILE)
         except Exception as e:
             bak = CONFIG_FILE + ".bak"
             try:
-                cfg = {**DEFAULT_CONFIG, **_read_config_file(bak)}
+                raw = _read_config_file(bak)
                 CONFIG_LOAD_WARNING.append(
                     f"O arquivo de configuração estava corrompido ({e}).\n"
                     f"Os dados foram recuperados do backup automático.")
@@ -248,7 +249,15 @@ def load_config():
                     f"havia backup. Ele foi renomeado para "
                     f"'{os.path.basename(CONFIG_FILE)}.corrompido' e o app\n"
                     f"começou com a configuração padrão.")
-    cfg, migrated = migrate_config(cfg)
+    migrated = False
+    if raw is not None:
+        # a versão tem de vir do ARQUIVO. Antes o arquivo era misturado com o
+        # padrão (que já diz config_version 2 e groups []) e só depois migrado:
+        # a config da v1.1.0 parecia v2, a migração nunca rodava e os PCs da
+        # Flag abririam a 2.0 sem os grupos Shopee e Mercado Livre
+        raw, migrated = migrate_config(raw)
+    # cópia funda: senão a lista "groups" do padrão seria compartilhada
+    cfg = {**json.loads(json.dumps(DEFAULT_CONFIG)), **(raw or {})}
     if migrated and os.path.exists(CONFIG_FILE):
         save_config(cfg)
     return cfg
@@ -309,10 +318,36 @@ def onedrive_roots():
                             r"Software\Microsoft\OneDrive\Accounts") as k:
             for i in range(winreg.QueryInfoKey(k)[0]):
                 try:
-                    with winreg.OpenKey(k, winreg.EnumKey(k, i)) as sub:
+                    conta = winreg.EnumKey(k, i)
+                except OSError:
+                    continue
+                try:
+                    with winreg.OpenKey(k, conta) as sub:
                         _add(winreg.QueryValueEx(sub, "UserFolder")[0])
                 except Exception:
-                    continue
+                    pass
+                # bibliotecas do SharePoint/Teams sincronizadas (conta da
+                # empresa) não ficam em UserFolder: cada pasta local é o NOME
+                # de um valor em Tenants\<empresa>, e também aparece em
+                # ScopeIdToMountPointPathCache
+                try:
+                    with winreg.OpenKey(k, conta + r"\Tenants") as ten:
+                        for j in range(winreg.QueryInfoKey(ten)[0]):
+                            try:
+                                with winreg.OpenKey(ten, winreg.EnumKey(ten, j)) as t:
+                                    for v in range(winreg.QueryInfoKey(t)[1]):
+                                        _add(winreg.EnumValue(t, v)[0])
+                            except OSError:
+                                continue
+                except OSError:
+                    pass
+                try:
+                    with winreg.OpenKey(
+                            k, conta + r"\ScopeIdToMountPointPathCache") as mp:
+                        for v in range(winreg.QueryInfoKey(mp)[1]):
+                            _add(winreg.EnumValue(mp, v)[1])
+                except OSError:
+                    pass
     except Exception:
         pass   # sem OneDrive instalado, ou registro indisponível
     return roots
@@ -959,10 +994,14 @@ def preset_para_grupo(p, nome_grupo):
     return p.replace("{nome}", nome_grupo).replace("{NOME}", nome_grupo.upper())
 
 
-def criar_lote(group, ano, mes, itens, log_fn, pause_od):
+def criar_lote(group, ano, mes, itens, log_fn, pause_od, criadas=None):
+    """Mesmo algoritmo da v1.1.0 (que está em produção): continua do maior
+    número do mês e cria 'CÓDIGO - Vazio' com '#ENVIAR' dentro. Em `criadas`
+    (lista) anota o caminho de cada pasta criada."""
     base    = group["base_path"]
     destino = mp_destino(group, ano, mes)
     prefixo = group.get("prefix", "")
+    provisorio = (group.get("provisorios") or PROVISORIOS_PADRAO)[0]
     if not os.path.exists(base):
         log_fn(f"ERRO: Caminho base não encontrado:\n{base}", erro=True)
         return 0
@@ -992,12 +1031,14 @@ def criar_lote(group, ano, mes, itens, log_fn, pause_od):
             for _ in range(qtd):
                 num += 1
                 codigo     = f"{prefixo}{mes_num}{num:04d}{responsavel}"
-                nome_pasta = f"{codigo} - Vazio"
+                nome_pasta = f"{codigo} - {provisorio}"
                 path_pasta = os.path.join(destino, nome_pasta)
                 if codigo.upper() not in existentes:
                     os.makedirs(path_pasta)
                     os.makedirs(os.path.join(path_pasta, "#ENVIAR"))
                     existentes.add(codigo.upper())
+                    if criadas is not None:
+                        criadas.append(path_pasta)
                     log_fn(f"  Criado: {nome_pasta}")
                     total += 1
                 else:
@@ -1147,6 +1188,251 @@ def mandar_para_lixeira(caminhos):
     return ok, erros
 
 
+# ── área de transferência de ARQUIVOS, a mesma do Explorador ────────────────
+# Formato CF_HDROP (lista de caminhos) + "Preferred DropEffect" (copiar ou
+# recortar). Assim, copiar aqui e colar no Explorador funciona, e vice-versa.
+CF_HDROP = 15
+_EFEITO_COPIAR, _EFEITO_MOVER = 5, 2          # DROPEFFECT_COPY|LINK, _MOVE
+
+
+def _clip_api():
+    import ctypes
+    from ctypes import wintypes as wt
+    u32, k32 = ctypes.windll.user32, ctypes.windll.kernel32
+    sh = ctypes.windll.shell32
+    u32.OpenClipboard.argtypes = [wt.HWND]
+    u32.OpenClipboard.restype = wt.BOOL
+    u32.SetClipboardData.argtypes = [wt.UINT, wt.HANDLE]
+    u32.SetClipboardData.restype = wt.HANDLE
+    u32.GetClipboardData.argtypes = [wt.UINT]
+    u32.GetClipboardData.restype = wt.HANDLE
+    u32.IsClipboardFormatAvailable.argtypes = [wt.UINT]
+    u32.RegisterClipboardFormatW.argtypes = [wt.LPCWSTR]
+    u32.RegisterClipboardFormatW.restype = wt.UINT
+    k32.GlobalAlloc.argtypes = [wt.UINT, ctypes.c_size_t]
+    k32.GlobalAlloc.restype = wt.HGLOBAL
+    k32.GlobalLock.argtypes = [wt.HGLOBAL]
+    k32.GlobalLock.restype = ctypes.c_void_p
+    k32.GlobalUnlock.argtypes = [wt.HGLOBAL]
+    k32.GlobalFree.argtypes = [wt.HGLOBAL]
+    sh.DragQueryFileW.argtypes = [wt.HANDLE, wt.UINT, wt.LPWSTR, wt.UINT]
+    sh.DragQueryFileW.restype = wt.UINT
+    return ctypes, u32, k32, sh
+
+
+def _clip_abre(u32, hwnd=None):
+    # outro programa pode estar com a área de transferência aberta agora
+    for _ in range(20):
+        if u32.OpenClipboard(hwnd):
+            return True
+        time.sleep(0.02)
+    return False
+
+
+def _clip_global(ctypes, k32, dados):
+    h = k32.GlobalAlloc(0x0042, len(dados))       # GMEM_MOVEABLE|ZEROINIT
+    if not h:
+        return None
+    p = k32.GlobalLock(h)
+    ctypes.memmove(p, dados, len(dados))
+    k32.GlobalUnlock(h)
+    return h
+
+
+def clipboard_escrever_arquivos(caminhos, recortar=False, hwnd=None):
+    """Põe os arquivos/pastas na área de transferência do Windows.
+    `hwnd`: uma janela do app — sem dona, o Windows recusa os dados."""
+    if sys.platform != "win32" or not caminhos:
+        return False
+    import struct
+    ctypes, u32, k32, _sh = _clip_api()
+    nomes = "".join(os.path.abspath(c) + "\0" for c in caminhos) + "\0"
+    # DROPFILES: pFiles, pt.x, pt.y, fNC, fWide
+    dados = struct.pack("<IiiII", 20, 0, 0, 0, 1) + nomes.encode("utf-16-le")
+    efeito = struct.pack("<I", _EFEITO_MOVER if recortar else _EFEITO_COPIAR)
+    fmt_efeito = u32.RegisterClipboardFormatW("Preferred DropEffect")
+    if not _clip_abre(u32, hwnd):
+        return False
+    try:
+        u32.EmptyClipboard()
+        for fmt, bloco in ((CF_HDROP, dados), (fmt_efeito, efeito)):
+            h = _clip_global(ctypes, k32, bloco)
+            if h and not u32.SetClipboardData(fmt, h):
+                k32.GlobalFree(h)                 # só libera se não aceitou
+                return False
+        return True
+    finally:
+        u32.CloseClipboard()
+
+
+def clipboard_ler_arquivos():
+    """Lê os arquivos da área de transferência do Windows.
+    Devolve (caminhos, recortar)."""
+    if sys.platform != "win32":
+        return [], False
+    ctypes, u32, k32, sh = _clip_api()
+    if not u32.IsClipboardFormatAvailable(CF_HDROP):
+        return [], False
+    fmt_efeito = u32.RegisterClipboardFormatW("Preferred DropEffect")
+    if not _clip_abre(u32):
+        return [], False
+    try:
+        h = u32.GetClipboardData(CF_HDROP)
+        if not h:
+            return [], False
+        n = sh.DragQueryFileW(h, 0xFFFFFFFF, None, 0)
+        caminhos = []
+        for i in range(n):
+            tam = sh.DragQueryFileW(h, i, None, 0)
+            buf = ctypes.create_unicode_buffer(tam + 1)
+            sh.DragQueryFileW(h, i, buf, tam + 1)
+            caminhos.append(buf.value)
+        recortar = False
+        he = u32.GetClipboardData(fmt_efeito)
+        if he:
+            p = k32.GlobalLock(he)
+            if p:
+                efeito = ctypes.c_uint32.from_address(p).value
+                k32.GlobalUnlock(he)
+                recortar = bool(efeito & _EFEITO_MOVER) and not (efeito & 1)
+        return caminhos, recortar
+    finally:
+        u32.CloseClipboard()
+
+
+def clipboard_sequencia():
+    """Muda sempre que qualquer programa mexe na área de transferência."""
+    if sys.platform != "win32":
+        return 0
+    import ctypes
+    return ctypes.windll.user32.GetClipboardSequenceNumber()
+
+
+def clipboard_limpar():
+    if sys.platform != "win32":
+        return
+    _ctypes, u32, _k32, _sh = _clip_api()
+    if _clip_abre(u32):
+        try:
+            u32.EmptyClipboard()
+        finally:
+            u32.CloseClipboard()
+
+
+def nome_livre(pasta, nome):
+    """'arte.cdr' → 'arte (2).cdr' se já existir (pastas: 'Nome (2)')."""
+    alvo = os.path.join(pasta, nome)
+    if not os.path.exists(alvo):
+        return alvo
+    raiz, ext = os.path.splitext(nome)
+    if os.path.isdir(alvo) or not ext:
+        raiz, ext = nome, ""
+    i = 2
+    while os.path.exists(os.path.join(pasta, f"{raiz} ({i}){ext}")):
+        i += 1
+    return os.path.join(pasta, f"{raiz} ({i}){ext}")
+
+
+def colar_itens(origens, destino, mover=False, avisa=None, pares=None):
+    """Copia (ou move) arquivos e pastas para `destino`. Conflito de nome
+    vira 'nome (2)'. Devolve (novos_caminhos, erros). Roda em segundo plano;
+    `avisa((i, total, nome))` informa o progresso. Em `pares` (lista) anota
+    (origem, novo) do que foi feito — é o que permite desfazer."""
+    novos, erros = [], []
+    dest_n = os.path.normcase(os.path.abspath(destino))
+    total = len(origens)
+    for i, src in enumerate(origens, 1):
+        nome = os.path.basename(src.rstrip("\\/")) or src
+        if avisa:
+            avisa((i, total, nome))
+        if not os.path.exists(src):
+            erros.append(f"'{nome}': não existe mais")
+            continue
+        src_n = os.path.normcase(os.path.abspath(src))
+        if os.path.isdir(src) and (dest_n == src_n
+                                   or dest_n.startswith(src_n + os.sep)):
+            erros.append(f"'{nome}': não dá para colar uma pasta dentro "
+                         "dela mesma")
+            continue
+        if mover and os.path.normcase(os.path.dirname(src_n)) == dest_n:
+            novos.append(src)                 # recortar e colar no mesmo lugar
+            continue
+        alvo = nome_livre(destino, nome)
+        try:
+            if mover:
+                shutil.move(src, alvo)
+            elif os.path.isdir(src):
+                shutil.copytree(src, alvo)
+            else:
+                shutil.copy2(src, alvo)
+            novos.append(alvo)
+            if pares is not None:
+                pares.append((src, alvo))
+        except (OSError, shutil.Error) as e:
+            erros.append(f"'{nome}': {getattr(e, 'strerror', None) or e}")
+    return novos, erros
+
+
+# ── desfazer: cada função devolve (pastas_afetadas, erro_ou_None) ───────────
+def desfaz_renomes(pares):
+    """pares: [(caminho_novo, caminho_antigo)] na mesma pasta. Volta os nomes
+    (trocas circulares A↔B passam pelo aplicar_rename, que já resolve)."""
+    por_pasta = {}
+    for novo, antigo in pares:
+        por_pasta.setdefault(os.path.dirname(novo), []).append(
+            (os.path.basename(novo), os.path.basename(antigo), None))
+    erros = []
+    for pasta, trios in por_pasta.items():
+        vivos = [t for t in trios if os.path.exists(os.path.join(pasta, t[0]))]
+        if len(vivos) < len(trios):
+            erros.append(f"{len(trios) - len(vivos)} item(ns) não existem mais")
+        _ok, e = aplicar_rename(pasta, vivos)
+        erros += e
+    return list(por_pasta), "; ".join(erros[:3]) or None
+
+
+def desfaz_colagem(pares, mover):
+    """pares: [(origem, novo)]. Cópia: os novos vão para a Lixeira.
+    Recorte: volta cada item para a pasta de onde veio."""
+    pastas = {os.path.dirname(n) for _o, n in pares}
+    if not mover:
+        vivos = [n for _o, n in pares if os.path.exists(n)]
+        _ok, erros = mandar_para_lixeira(vivos)
+        return list(pastas), "; ".join(erros[:3]) or None
+    erros = []
+    for origem, novo in pares:
+        if os.path.normcase(origem) == os.path.normcase(novo):
+            continue
+        pastas.add(os.path.dirname(origem))
+        if not os.path.exists(novo):
+            erros.append(f"'{os.path.basename(novo)}' não existe mais")
+        elif os.path.exists(origem):
+            erros.append(f"já existe '{os.path.basename(origem)}' na origem")
+        else:
+            try:
+                shutil.move(novo, origem)
+            except (OSError, shutil.Error) as e:
+                erros.append(str(e))
+    return list(pastas), "; ".join(erros[:3]) or None
+
+
+def desfaz_criacao(caminho):
+    """Pasta/arquivo recém-criado vai para a Lixeira — só se continuar vazio
+    (se já puseram coisa dentro, desfazer apagaria trabalho)."""
+    pasta = [os.path.dirname(caminho)]
+    if not os.path.exists(caminho):
+        return pasta, None
+    try:
+        if os.path.isdir(caminho) and os.listdir(caminho):
+            return pasta, "a pasta já tem coisa dentro"
+        if os.path.isfile(caminho) and os.path.getsize(caminho) > 0:
+            return pasta, "o arquivo já foi editado"
+    except OSError as e:
+        return pasta, str(e)
+    _ok, erros = mandar_para_lixeira([caminho])
+    return pasta, "; ".join(erros) or None
+
+
 def pasta_protegida(caminho):
     """Motivo para NÃO deixar apagar esta pasta inteira, ou None."""
     if not caminho:
@@ -1173,23 +1459,6 @@ def pasta_protegida(caminho):
         if p == r.rstrip("\\/"):
             return "é a raiz do OneDrive"
     return None
-
-
-def tamanho_de(caminho):
-    """Tamanho total em bytes (percorre subpastas). Best-effort."""
-    if os.path.isfile(caminho):
-        try:
-            return os.path.getsize(caminho)
-        except OSError:
-            return 0
-    total = 0
-    for root, _dirs, files in os.walk(caminho):
-        for f in files:
-            try:
-                total += os.path.getsize(os.path.join(root, f))
-            except OSError:
-                pass
-    return total
 
 
 def fmt_tamanho(b):
@@ -1223,26 +1492,6 @@ def buscar_pastas(base, termo, limite=100, profundidade=6):
         if nivel + 1 >= profundidade:
             dirs[:] = []
     return (exatos + parecidos)[:limite]
-
-
-def buscar_pasta_por_codigo(bases, codigo):
-    codigo = codigo.strip().upper()
-    for base in bases:
-        if not base or not os.path.exists(base):
-            continue
-        for root, dirs, _ in os.walk(base):
-            for d in dirs:
-                if d.split(" - ")[0].upper() == codigo:
-                    return os.path.join(root, d), d
-    return None, None
-
-
-def renomear_pasta(path_atual, nome_cliente):
-    dir_pai    = os.path.dirname(path_atual)
-    codigo     = os.path.basename(path_atual).split(" - ")[0]
-    novo_path  = os.path.join(dir_pai, f"{codigo} - {nome_cliente.strip()}")
-    os.rename(path_atual, novo_path)
-    return novo_path
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1400,6 +1649,25 @@ def conferir_pasta(pai, provisorios=None, usa_enviar=True, prefixo="",
             "tem_enviar": entregue, "provisorios": list(provisorios),
         })
 
+    # número repetido no mês: duas pessoas criando lote ao mesmo tempo com o
+    # OneDrive pausado partem do mesmo número (090045IT e 090045AB)
+    por_numero = {}
+    for it in itens:
+        if not it["tem_codigo"]:
+            continue
+        cod = it["codigo"].upper()
+        if prefixo and cod.startswith(prefixo.upper()):
+            cod = cod[len(prefixo):]
+        m = re.match(r"^(\d{2})(\d+)[A-Z]+$", cod)
+        if m:
+            por_numero.setdefault((m.group(1), int(m.group(2))), []).append(it)
+    duplicados = []
+    for (_mm, _n), grupo_it in sorted(por_numero.items()):
+        if len(grupo_it) > 1:
+            for it in grupo_it:
+                it["duplicado"] = True
+            duplicados.append([it["nome"] for it in grupo_it])
+
     por_pessoa = {}
     for it in itens:
         p = por_pessoa.setdefault(
@@ -1408,7 +1676,8 @@ def conferir_pasta(pai, provisorios=None, usa_enviar=True, prefixo="",
              "nao_renomeada": 0})
         p["total"] += 1
         p[it["estado"]] += 1
-    return {"destino": pai, "itens": itens, "por_pessoa": por_pessoa}
+    return {"destino": pai, "itens": itens, "por_pessoa": por_pessoa,
+            "duplicados": duplicados}
 
 
 def conferir_pastas(group, ano, mes):
@@ -1537,47 +1806,6 @@ def meses_existentes(group, ano):
     return saida
 
 
-def gerar_relatorio(group, ano, mes):
-    destino = mp_destino(group, ano, mes)
-    prefixo = group.get("prefix", "")
-    resultado = {
-        "destino": destino, "total": 0, "vazio": 0,
-        "com_cliente": 0, "com_arquivo": 0, "sem_arquivo": 0,
-        "por_pessoa": {}, "lista": [],
-    }
-    if not os.path.exists(destino):
-        return resultado
-    for nome in sorted(os.listdir(destino)):
-        if not os.path.isdir(os.path.join(destino, nome)):
-            continue
-        partes = nome.split(" - ", 1)
-        if len(partes) < 2:
-            continue
-        codigo, cliente = partes[0], partes[1]
-        cod_s = codigo[len(prefixo):] if prefixo and codigo.startswith(prefixo) else codigo
-        iniciais = ""
-        for ch in reversed(cod_s):
-            if ch.isalpha():
-                iniciais = ch + iniciais
-            else:
-                break
-        is_vazio    = cliente.strip().upper() == "VAZIO"
-        path_enviar = os.path.join(destino, nome, "#ENVIAR")
-        tem_arquivo = (os.path.exists(path_enviar) and
-                       any(os.path.isfile(os.path.join(path_enviar, f))
-                           for f in os.listdir(path_enviar)))
-        resultado["total"] += 1
-        resultado["vazio" if is_vazio else "com_cliente"] += 1
-        resultado["com_arquivo" if tem_arquivo else "sem_arquivo"] += 1
-        if iniciais:
-            resultado["por_pessoa"][iniciais] = resultado["por_pessoa"].get(iniciais, 0) + 1
-        resultado["lista"].append({
-            "codigo": codigo, "cliente": cliente,
-            "vazio": is_vazio, "tem_arquivo": tem_arquivo,
-        })
-    return resultado
-
-
 # ═══════════════════════════════════════════════════════════════════════════════
 # ÍNDICE LOCAL (busca instantânea em todos os grupos)
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1588,7 +1816,12 @@ def build_index(groups, progress_fn=None):
         if not base or not os.path.exists(base):
             continue
         label = g["name"].upper()
+        mp = g.get("kind") == "marketplace"
+        re_cod = codigo_re_do_grupo(g) if mp else None
         for root, dirs, _ in os.walk(base):
+            # '#ENVIAR' e afins não são pastas de cliente: não entram nem
+            # são percorridas (antes o índice dobrava de tamanho por causa delas)
+            dirs[:] = [d for d in dirs if not d.startswith("#")]
             for d in dirs:
                 caminho = os.path.join(root, d)
                 if " - " in d:
@@ -1611,6 +1844,10 @@ def build_index(groups, progress_fn=None):
                 }
                 if progress_fn:
                     progress_fn(d)
+            if mp:
+                # dentro da pasta de um cliente só há arquivos de trabalho:
+                # não precisa descer (numa base do OneDrive isso é o grosso)
+                dirs[:] = [d for d in dirs if not re_cod.match(d)]
     return index
 
 
@@ -1618,15 +1855,58 @@ def load_index():
     if os.path.exists(INDEX_FILE):
         try:
             with open(INDEX_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
+                d = json.load(f)
+                return d if isinstance(d, dict) else {}
         except Exception:
             return {}
     return {}
 
 
 def save_index(index):
-    with open(INDEX_FILE, "w", encoding="utf-8") as f:
-        json.dump(index, f, ensure_ascii=False, indent=2)
+    """Gravação atômica: um travamento no meio não corrompe o índice. Sem
+    indentação — o arquivo fica bem menor e a v1.1.0 lê do mesmo jeito."""
+    tmp = INDEX_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(index, f, ensure_ascii=False, separators=(",", ":"))
+    os.replace(tmp, INDEX_FILE)
+
+
+def entrada_indice(caminho, grupo_nome):
+    nome = os.path.basename(caminho)
+    if " - " in nome:
+        codigo, cliente = nome.split(" - ")[0].upper(), nome.split(" - ", 1)[1]
+    else:
+        codigo, cliente = nome.upper(), ""
+    return codigo, {"path": caminho, "nome": nome, "plat": grupo_nome.upper(),
+                    "cliente": cliente, "codigo": codigo}
+
+
+def indice_troca(index, caminho_antigo, caminho_novo, grupo_nome):
+    """Atualiza o índice depois de renomear: tira a entrada antiga (seja qual
+    for a chave) e põe a nova, sem sobrescrever outra pasta de mesmo código."""
+    alvo = os.path.normcase(os.path.normpath(caminho_antigo or ""))
+    for k in [k for k, v in index.items()
+              if os.path.normcase(os.path.normpath(v.get("path", ""))) == alvo]:
+        index.pop(k, None)
+    codigo, entrada = entrada_indice(caminho_novo, grupo_nome)
+    chave = codigo
+    if chave in index and os.path.normcase(index[chave].get("path", "")) != \
+            os.path.normcase(caminho_novo):
+        chave = f"{codigo}\x00{caminho_novo.upper()}"
+    index[chave] = entrada
+    return index
+
+
+_COD_NO_CARD = re.compile(r"^\s*[A-Z]{0,3}\d{6}[A-Z]+\s*-\s*", re.IGNORECASE)
+
+
+def titulo_card(codigo, nome_card):
+    """Título do card com o código na frente, como na v1.1.0 — mas sem
+    duplicar: se o card JÁ começa com um código, devolve None (não mexe)."""
+    nome_card = nome_card or ""
+    if _COD_NO_CARD.match(nome_card):
+        return None
+    return f"{codigo} - {nome_card}"
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1822,6 +2102,18 @@ DARK_TXT = "#101014"
 MONO = ("Consolas", 11)
 
 
+def tamanho_janela(tela_w, tela_h, escala=1.0, ideal=(1120, 740),
+                   minimo=(960, 640)):
+    """(largura, altura, mín_largura, mín_altura) em unidades do CTk, que
+    multiplica tudo pela escala do Windows. Desconta a barra de tarefas e a
+    barra de título para a janela inteira ficar visível."""
+    escala = escala or 1.0
+    cabe_w = int((tela_w - 16) / escala)
+    cabe_h = int((tela_h - 90) / escala)
+    w, h = min(ideal[0], cabe_w), min(ideal[1], cabe_h)
+    return w, h, min(minimo[0], w), min(minimo[1], h)
+
+
 def F(size=13, bold=False):
     return ctk.CTkFont(family="Segoe UI", size=size,
                        weight="bold" if bold else "normal")
@@ -1857,12 +2149,6 @@ def tb_write(tb, msg, tag="dim", timestamp=True):
     prefix = f"[{datetime.datetime.now():%H:%M:%S}] " if timestamp else ""
     tb.insert("end", f"{prefix}{msg}\n", tag)
     tb.see("end")
-    tb.configure(state="disabled")
-
-
-def tb_clear(tb):
-    tb.configure(state="normal")
-    tb.delete("1.0", "end")
     tb.configure(state="disabled")
 
 
@@ -2135,6 +2421,13 @@ class TreeCanvas(tk.Frame):
         self._hover    = -1
         self._bg_ids   = {}
         self._gen      = 0
+        self._pressionado   = False
+        self._topo_desejado = None
+        self.recortados     = set()     # itens recortados: ficam apagados
+        self.on_shortcut    = None      # on_shortcut(nome, shift) → Ctrl+tecla
+        self._filtro        = ""
+        self.filtro_expande = False     # True: o filtro procura no que está fechado
+        self.n_encontrados  = None
 
         self.canvas = tk.Canvas(self, bg=BG_PANEL, bd=0, highlightthickness=0,
                                 takefocus=True, yscrollincrement=self.ROW_H)
@@ -2174,25 +2467,75 @@ class TreeCanvas(tk.Frame):
         c.bind("<Down>",             lambda e: self._move_sel(1))
         c.bind("<Left>",             lambda e: self._arrow_collapse())
         c.bind("<Right>",            lambda e: self._arrow_expand())
+        c.bind("<Button-1>", lambda e: setattr(self, "_pressionado", True),
+               add="+")
+        c.bind("<ButtonRelease-1>",
+               lambda e: setattr(self, "_pressionado", False))
+        # Ctrl+letra pelo código da tecla: funciona com Caps Lock ligado e
+        # em qualquer layout de teclado (o keysym muda, a tecla física não)
+        c.bind("<Control-KeyPress>", self._on_ctrl_key)
+
+    _ATALHOS = {67: "copy", 88: "cut", 86: "paste", 65: "all", 78: "new",
+                90: "undo", 70: "find", 68: "duplicate"}
+
+    def _on_ctrl_key(self, ev):
+        nome = self._ATALHOS.get(ev.keycode)
+        if nome is None:
+            return None
+        if nome == "all" and self.multi:
+            self._sel = [r.key for r in self._flat if r.payload]
+            self._redraw()
+            if self.on_select:
+                self.on_select(self.selection())
+        elif nome == "duplicate":
+            self._fire_action("duplicate")
+        elif self.on_shortcut:
+            self.on_shortcut(nome, bool(ev.state & 0x0001))
+        return "break"
 
     # ── dados ────────────────────────────────────────────────────────────────
     def set_provider(self, provider):
         self.provider = provider
         self.reload()
 
+    def ocupado(self):
+        """Renomeando (F2) ou com o botão do mouse pressionado: não é hora
+        de trocar as linhas debaixo do usuário."""
+        return self._edit_idx >= 0 or self._pressionado
+
+    def expanded_keys(self):
+        return set(self._expanded)
+
+    def _ancora(self):
+        """Linha no topo da vista, para itens novos acima não empurrarem o
+        que o usuário está olhando."""
+        try:
+            topo = self.canvas.canvasy(0)
+        except Exception:
+            return None
+        i = int(topo // self.ROW_H)
+        if topo > 0 and 0 <= i < len(self._flat):
+            return self._flat[i].key, topo - i * self.ROW_H, topo
+        return None
+
     def reload(self, keep=True):
-        """Reconstrói a lista visível preservando expansão e seleção."""
+        """Reconstrói a lista visível preservando expansão, seleção e a
+        posição da rolagem."""
         self._cancel_edit()
+        ancora = self._ancora() if keep else None
         if not keep:
             self._expanded.clear()
             self._sel.clear()
         flat = []
+        # filtrando o modelo (em memória), procura também no que está fechado;
+        # no disco só no que já foi lido — abrir pastas dispararia leituras
+        abre_tudo = bool(self._filtro) and self.filtro_expande
         if self.provider is not None:
             def walk(rows, depth):
                 for r in rows:
                     r.depth = depth
                     flat.append(r)
-                    if r.expandable and r.key in self._expanded:
+                    if r.expandable and (abre_tudo or r.key in self._expanded):
                         r.expanded = True
                         walk(self.provider.children(r), depth + 1)
                     else:
@@ -2201,10 +2544,45 @@ class TreeCanvas(tk.Frame):
                 walk(self.provider.roots(), 0)
             except Exception:
                 flat = []
+        self.n_encontrados = None
+        if self._filtro:
+            flat = self._aplica_filtro(flat)
         self._flat = flat
         vivos = {r.key for r in flat}
         self._sel = [k for k in self._sel if k in vivos]
+        self._topo_desejado = None
+        if ancora is not None:
+            chave, desloc, topo = ancora
+            for j, r in enumerate(flat):
+                if r.key == chave:
+                    self._topo_desejado = j * self.ROW_H + desloc
+                    break
+            else:
+                self._topo_desejado = topo
         self._redraw()
+
+    def set_filtro(self, texto):
+        """Mostra só as linhas cujo nome contém o texto (sem ligar para
+        acento nem maiúsculas), mais as pastas acima delas."""
+        texto = (texto or "").strip()
+        if texto == self._filtro:
+            return
+        self._filtro = texto
+        self.reload()
+
+    def _aplica_filtro(self, flat):
+        termo = _norm(self._filtro)
+        manter = [False] * len(flat)
+        pilha, n = [], 0
+        for i, r in enumerate(flat):
+            del pilha[r.depth:]
+            pilha.append(i)
+            if r.payload is not None and termo in _norm(r.label):
+                n += 1
+                for j in pilha:
+                    manter[j] = True
+        self.n_encontrados = n
+        return [r for i, r in enumerate(flat) if manter[i]]
 
     def rows(self):
         return list(self._flat)
@@ -2302,8 +2680,12 @@ class TreeCanvas(tk.Frame):
         w = max(c.winfo_width(), 10)
         total = len(self._flat) * self.ROW_H
         c.configure(scrollregion=(0, 0, w, self._region_h()))
-        if total <= c.winfo_height() and c.canvasy(0) != 0:
-            c.yview_moveto(0)
+        desejado, self._topo_desejado = self._topo_desejado, None
+        if total <= c.winfo_height():
+            if c.canvasy(0) != 0:
+                c.yview_moveto(0)
+        elif desejado is not None and desejado != c.canvasy(0):
+            c.yview_moveto(desejado / self._region_h())
 
         i0, i1 = self._visible_range()
         for i in range(i0, i1):
@@ -2334,7 +2716,7 @@ class TreeCanvas(tk.Frame):
         cor_txt = FG_DIM if r.state == "exists" else FG_MAIN
         if r.kind in ("file", "copy"):
             cor_txt = FG_DIM if r.state == "exists" else FG_LABEL
-        if r.state == "loading":
+        if r.state == "loading" or r.key in self.recortados:
             cor_txt = FG_DIM
 
         c.create_text(self._x_icon(r.depth), cy, text=r.icon, fill=cor_txt,
@@ -2371,12 +2753,6 @@ class TreeCanvas(tk.Frame):
                           font=self.font, anchor="center",
                           tags=tag + ("act:delete",))
 
-    def refresh_row(self, key):
-        for i, r in enumerate(self._flat):
-            if r.key == key:
-                self._redraw()
-                return
-
     # ── interação ────────────────────────────────────────────────────────────
     def _index_at(self, ev_y):
         y = self.canvas.canvasy(ev_y)
@@ -2406,6 +2782,9 @@ class TreeCanvas(tk.Frame):
         self._draw_row(i, max(self.canvas.winfo_width(), 10))
 
     def _on_motion(self, ev):
+        if not (ev.state & 0x0100):
+            # soltou o botão fora (ex.: um diálogo engoliu o ButtonRelease)
+            self._pressionado = False
         self._set_hover(self._index_at(ev.y))
 
     def _on_wheel(self, ev):
@@ -2642,6 +3021,10 @@ class DiskTreeProvider:
         # não é confiável)
         self._fila = queue.Queue()
         self._bombeando = False
+        self._carimbos = {}            # chave → mtime da última leitura
+        self._paths = {}               # chave → caminho com a caixa original
+        self._refrescando = False
+        self._pendente = []
 
     def _key(self, path):
         return os.path.normcase(os.path.abspath(path))
@@ -2694,6 +3077,45 @@ class DiskTreeProvider:
         arquivos.sort(key=lambda r: r.label.lower())
         return pastas + arquivos
 
+    @staticmethod
+    def _carimbo(path):
+        """Carimbo de modificação da pasta. No NTFS ele muda quando algo é
+        criado, apagado ou renomeado DENTRO dela — é o que a árvore precisa."""
+        try:
+            return os.stat(path).st_mtime_ns
+        except OSError:
+            return None
+
+    def _guarda(self, k, path, filhos, carimbo):
+        """Troca a listagem de uma pasta. Devolve True se algo mudou."""
+        antigo = self._cache.get(k)
+        self._cache[k] = filhos
+        self._paths[k] = path
+        # o relógio dos carimbos anda em "tiques" de ~15 ms: duas mudanças no
+        # mesmo tique ficam com o mesmo carimbo. Carimbo recente não é
+        # confiável — fica vazio e a próxima conferência relê de novo.
+        if carimbo is not None and time.time_ns() - carimbo < 3_000_000_000:
+            carimbo = None
+        self._carimbos[k] = carimbo
+        if antigo is None:
+            return True
+        assin = lambda rs: [(r.key, r.label, r.kind) for r in rs]
+        if assin(antigo) == assin(filhos):
+            return False
+        # o que sumiu leva junto o cache das subpastas (se voltar, relê)
+        novos = {r.key for r in filhos}
+        for r in antigo:
+            if r.key not in novos:
+                self._esquece(r.key)
+        return True
+
+    def _esquece(self, k):
+        pref = k.rstrip(os.sep) + os.sep
+        for c in [c for c in self._cache if c == k or c.startswith(pref)]:
+            self._cache.pop(c, None)
+            self._carimbos.pop(c, None)
+            self._paths.pop(c, None)
+
     def children(self, row):
         """Devolve na hora: do cache, ou um marcador enquanto lê em segundo
         plano (uma pasta no OneDrive pode demorar segundos para responder)."""
@@ -2702,7 +3124,7 @@ class DiskTreeProvider:
         if k in self._cache:
             return [self._clone(r) for r in self._cache[k]]
         if self._after is None:            # sem UI: leitura direta
-            self._cache[k] = self._ler(path)
+            self._guarda(k, path, self._ler(path), self._carimbo(path))
             return [self._clone(r) for r in self._cache[k]]
         if k not in self._carregando:
             self._carregando.add(k)
@@ -2710,40 +3132,125 @@ class DiskTreeProvider:
 
             def tarefa():
                 try:
+                    carimbo = self._carimbo(path)
                     filhos = self._ler(path)
                 except Exception:
-                    filhos = []
-                self._fila.put((gen, k, path, filhos))
+                    carimbo, filhos = None, []
+                self._fila.put(("ler", gen, [(k, path, filhos, carimbo)]))
             threading.Thread(target=tarefa, daemon=True).start()
             self._inicia_bomba()
         return [TreeRow(key=k + "|load", depth=0, label="carregando…",
                         icon="⏳", kind="file", payload=None, state="loading")]
+
+    # ── releitura sem piscar ────────────────────────────────────────────────
+    def refresh(self, paths=None, force=False, depois=None, so=None):
+        """Relê em segundo plano e troca tudo de uma vez — o cache antigo
+        continua na tela enquanto isso, então nada pisca nem some.
+        - paths: pastas a reler (padrão: todas já lidas)
+        - so: limita às chaves informadas (o vigia passa só as abertas)
+        - force: relê mesmo sem o carimbo ter mudado (ações do próprio app)
+        - depois: chamado na thread da tela quando terminar"""
+        if paths is None:
+            alvos = [(k, self._paths.get(k, k)) for k in list(self._cache)
+                     if so is None or k in so]
+        else:
+            alvos = [(self._key(p), p) for p in paths if p]
+        if self._refrescando:
+            # já tem uma releitura rodando: guarda para depois. Conferências
+            # do vigia repetidas (OneDrive lento) não se acumulam.
+            pedido = (paths, force, depois, so)
+            if force or depois or paths is not None \
+                    or pedido not in self._pendente:
+                self._pendente.append(pedido)
+            return
+        antigos = {k: self._carimbos.get(k) for k, _p in alvos}
+        antigos_force = force
+        gen = self._gen
+
+        def tarefa():
+            res = []
+            for k, path in alvos:
+                c = self._carimbo(path)
+                if c is None:
+                    res.append((k, path, None, None))        # pasta sumiu
+                elif antigos_force or c != antigos.get(k):
+                    try:
+                        res.append((k, path, self._ler(path), c))
+                    except Exception:
+                        pass
+            return res
+
+        if self._after is None:                 # sem UI: direto
+            self._aplica(gen, tarefa(), depois)
+            return
+        self._refrescando = True
+
+        def roda():
+            try:
+                res = tarefa()
+            except Exception:
+                res = []
+            self._fila.put(("refresh", gen, res, depois))
+        threading.Thread(target=roda, daemon=True).start()
+        self._inicia_bomba()
+
+    def _aplica(self, gen, res, depois=None):
+        mudou = False
+        if gen == self._gen:
+            for k, path, filhos, carimbo in res:
+                if filhos is None:
+                    if k in self._cache:
+                        self._esquece(k)
+                        mudou = True
+                elif self._guarda(k, path, filhos, carimbo):
+                    mudou = True
+        if mudou and self.on_ready:
+            try:
+                self.on_ready(None)
+            except Exception:
+                pass
+        if depois:
+            try:
+                depois()
+            except Exception:
+                pass
+        return mudou
 
     def _inicia_bomba(self):
         """Agenda a drenagem da fila. Chamado sempre da thread da interface."""
         if self._bombeando or self._after is None:
             return
         self._bombeando = True
-        self._after(60, self._bombear)
+        self._after(40, self._bombear)
 
     def _bombear(self):
         prontos = []
         while True:
             try:
-                gen, k, path, filhos = self._fila.get_nowait()
+                msg = self._fila.get_nowait()
             except queue.Empty:
                 break
-            self._carregando.discard(k)
-            if gen == self._gen:        # descarta leitura obsoleta
-                self._cache[k] = filhos
-                prontos.append(path)
+            if msg[0] == "ler":
+                _t, gen, res = msg
+                for k, path, filhos, carimbo in res:
+                    self._carregando.discard(k)
+                    if gen == self._gen:        # descarta leitura obsoleta
+                        self._guarda(k, path, filhos, carimbo)
+                        prontos.append(path)
+            else:
+                _t, gen, res, depois = msg
+                self._refrescando = False
+                self._aplica(gen, res, depois)
+                if self._pendente:
+                    p, f, d, s = self._pendente.pop(0)
+                    self.refresh(p, force=f, depois=d, so=s)
         if prontos and self.on_ready:
             try:
                 self.on_ready(prontos[-1])
             except Exception:
                 pass
-        if self._carregando:
-            self._after(60, self._bombear)
+        if self._carregando or self._refrescando:
+            self._after(40, self._bombear)
         else:
             self._bombeando = False
 
@@ -2753,12 +3260,454 @@ class DiskTreeProvider:
         return n
 
     def invalidate(self, path=None):
+        """Descarta o cache (a pasta volta a mostrar 'carregando…').
+        Na tela use refresh(), que não pisca."""
         self._gen += 1
         self._carregando.clear()
         if path is None:
             self._cache.clear()
+            self._carimbos.clear()
         else:
-            self._cache.pop(self._key(path), None)
+            self._esquece(self._key(path))
+
+
+class DiskWatch:
+    """Vigia leve das pastas ABERTAS na árvore: a cada ~2s confere o carimbo
+    de modificação em segundo plano e só relê o que mudou (inclusive por
+    fora, pelo Explorador). Parado com a janela minimizada ou a aba oculta,
+    mais lento sem foco, e relê na hora quando o app volta a ter foco."""
+
+    def __init__(self, tree, provider, intervalo=2000):
+        self.tree = tree
+        self.provider = provider
+        self.intervalo = intervalo
+        self._ultimo = 0.0
+        self._job = None
+        top = tree.winfo_toplevel()
+        self._fid = top.bind("<FocusIn>", self._voltou, add="+")
+        self._job = tree.after(intervalo, self._tick)
+        tree.bind("<Destroy>", self._fim, add="+")
+
+    def _vivo(self):
+        try:
+            return bool(self.tree.winfo_exists())
+        except Exception:
+            return False
+
+    def _visivel(self):
+        try:
+            top = self.tree.winfo_toplevel()
+            return top.state() != "iconic" and self.tree.winfo_ismapped()
+        except Exception:
+            return False
+
+    def conferir(self):
+        """Pede a releitura das pastas abertas (só o que mudou de carimbo)."""
+        if not self._vivo() or not self._visivel():
+            return
+        self._ultimo = time.time()
+        abertas = self.tree.expanded_keys()
+        if abertas:
+            self.provider.refresh(so=abertas)
+
+    def _tick(self):
+        self._job = None
+        if not self._vivo():
+            return
+        self.conferir()
+        try:
+            focado = self.tree.winfo_toplevel().focus_displayof() is not None
+        except Exception:
+            focado = False
+        atraso = self.intervalo if focado else self.intervalo * 3
+        self._job = self.tree.after(atraso, self._tick)
+
+    def _voltou(self, _ev=None):
+        # o FocusIn chega para cada widget que ganha foco: só conta a volta
+        # de verdade (mais de 1s desde a última conferência)
+        if time.time() - self._ultimo > 1.0:
+            self.conferir()
+
+    def _fim(self, ev=None):
+        if ev is not None and ev.widget is not self.tree:
+            return
+        try:
+            if self._job:
+                self.tree.after_cancel(self._job)
+            self.tree.winfo_toplevel().unbind("<FocusIn>", self._fid)
+        except Exception:
+            pass
+
+
+class Tour:
+    """"Conhecer o app": destaca a área de verdade na tela com uma moldura
+    verde e explica num balão. Roda em dois grupos de exemplo, numa pasta
+    temporária — nada do usuário é tocado, e tudo é apagado no fim."""
+
+    MOLDURA = 3
+
+    def __init__(self, app):
+        self.app = app
+        self.ativo = False
+        self.i = 0
+        self.raiz = None
+        self.ge = self.gm = None
+        self._barras = []
+        self._balao = None
+        self._job = None
+        self._binds = []
+        self._onde = None               # (id do grupo, aba) aberto pelo tour
+
+    # ── grupos de exemplo ────────────────────────────────────────────────────
+    def _cria_exemplos(self):
+        raiz = tempfile.mkdtemp(prefix="FolderFlow tour ")
+        self.raiz = raiz
+        base_e = os.path.join(raiz, "Estrutura")
+        os.makedirs(os.path.join(base_e, "Cliente 0001", "Artes"))
+        os.makedirs(os.path.join(base_e, "Cliente 0002"))
+        open(os.path.join(base_e, "Cliente 0001", "Artes", "logo.cdr"),
+             "w").close()
+        ge = default_group("template")
+        ge.update({"name": "Exemplo — Estrutura", "base_path": base_e,
+                   "color": GROUP_COLORS[1], "tour": True, "tour_raiz": raiz,
+                   "template": "[3] Cliente {seq:04d}/\n  Artes/\n"
+                               "  Aprovação/\n"
+                               "  infos.txt = Dados do cliente {seq:04d}\n"})
+        gm = preset_marketplace_groups()[0]
+        gm.update({"id": uuid.uuid4().hex[:8], "name": "Exemplo — Loja",
+                   "base_path": os.path.join(raiz, "Loja"),
+                   "dest_pattern": "{ano}/{mes}", "board_id": "",
+                   "color": GROUP_COLORS[2], "tour": True, "tour_raiz": raiz})
+        agora = datetime.datetime.now()
+        mes = MESES[agora.month - 1]
+        dest = mp_destino(gm, str(agora.year), mes)
+        mn = mes[:2]
+        for nome, arqs, enviar in (
+                (f"{mn}0001IT - Padaria Central", (), ("arte final.pdf",)),
+                (f"{mn}0002IT - Mercado Bom Preço", (), ()),
+                (f"{mn}0003AB - Vazio", (), ()),
+                (f"{mn}0004AB - Vazio", ("Restaurante Bom Prato.cdr",), ())):
+            p = os.path.join(dest, nome)
+            os.makedirs(os.path.join(p, "#ENVIAR"))
+            for a in arqs:
+                open(os.path.join(p, a), "w").close()
+            for a in enviar:
+                open(os.path.join(p, "#ENVIAR", a), "w").close()
+        self.ge, self.gm = ge, gm
+        self.app.config_data["groups"].extend([ge, gm])
+        self.app.save()
+
+    def _apaga_exemplos(self):
+        gs = self.app.config_data.get("groups", [])
+        for g in (self.ge, self.gm):
+            if g in gs:
+                gs.remove(g)
+        self.app.save()
+        if self.raiz:
+            shutil.rmtree(self.raiz, ignore_errors=True)
+        self.raiz = None
+
+    # ── roteiro ──────────────────────────────────────────────────────────────
+    def _ir(self, g, aba):
+        """Abre o grupo e a aba (sem remontar se já estiver lá)."""
+        app = self.app
+        tabs = getattr(app, "_tabs_grupo", None)
+        try:
+            vivo = tabs is not None and tabs.winfo_exists()
+        except Exception:
+            vivo = False
+        if not vivo or self._onde is None or self._onde[0] != g["id"]:
+            app.show_group(g)
+        app._tabs_grupo.set(aba)
+        self._onde = (g["id"], aba)
+
+    def _home(self):
+        self._onde = None
+        self.app.show_home()
+
+    def _clica(self, nome):
+        b = self.app.alvo(nome)
+        if b is not None:
+            self.app.after(100, b.invoke)
+
+    def passos(self):
+        a = self.app
+        ge, gm = self.ge, self.gm
+        return [
+            ("Seus grupos",
+             "Cada card é um grupo: uma pasta base + um jeito de organizar. "
+             "Clique num card para abrir.\n\nDica: Ctrl+K abre a paleta — "
+             "digite o nome de um grupo, um comando ou o código de uma pasta.",
+             self._home, "home_grade"),
+            ("Um grupo de exemplo",
+             "Criamos dois grupos de exemplo numa pasta temporária — pode "
+             "mexer à vontade, eles somem no fim do tour.\n\n⚡ Criar agora "
+             "cria a estrutura sem nem abrir o grupo. A linha amarela mostra "
+             "o que está pendente.",
+             self._home, f"card_{ge['id']}"),
+            ("Pastas: o explorador",
+             "Aqui estão as pastas de verdade. Botão direito mostra tudo o "
+             "que dá para fazer.\n\n• F2 renomeia · Del manda para a Lixeira\n"
+             "• Ctrl+C / Ctrl+V funcionam junto com o Explorador do Windows\n"
+             "• Ctrl+Z desfaz · duplo clique abre o arquivo\n"
+             "• Mudou algo por fora? Aparece sozinho.",
+             lambda: self._ir(ge, a.ABA_PASTAS), "pastas_arvore"),
+            ("A barra de ações",
+             "Nova pasta, renomear um ou vários de uma vez, desfazer (↶) e o "
+             "filtro (Ctrl+F) para achar uma pasta no meio de muitas.\n\n"
+             "Embaixo, a barra de status mostra o caminho e o tamanho do "
+             "que está selecionado.",
+             lambda: self._ir(ge, a.ABA_PASTAS), "pastas_barra"),
+            ("Modelo: a receita das pastas",
+             "Monte a estrutura uma vez e crie quantas vezes quiser.\n\n"
+             "• 🔁 Sequência: 200 pastas numeradas de uma vez\n"
+             "• 📎 Anexo: copia um arquivo (ex.: PDF gabarito) para dentro\n"
+             "• Botão direito: renomear, duplicar, copiar e colar partes",
+             lambda: self._ir(ge, a.ABA_MODELO), "modelo_construtor"),
+            ("Prévia e criar",
+             "A prévia mostra o que vai ser criado. ✓ = já existe e é "
+             "pulado, então criar de novo nunca estraga nada.\n\n"
+             "“Criar estrutura” cria tudo na pasta base.",
+             lambda: self._ir(ge, a.ABA_MODELO), "modelo_previa"),
+            ("Marketplace: criar o lote",
+             "Nos grupos de marketplace, cada pessoa recebe suas pastas "
+             "numeradas com código e iniciais.\n\nDigite o total e use "
+             "“Dividir igualmente”. O app lembra quem costuma receber.",
+             lambda: self._ir(gm, a.ABA_CRIAR), "mp_pessoas"),
+            ("A fita de meses",
+             "Mostra de relance quais meses já existem. Verde é o atual.\n\n"
+             "Se você criar num mês que ainda não existe, a pasta do mês é "
+             "criada sozinha.",
+             lambda: self._ir(gm, a.ABA_CRIAR), "fita_meses"),
+            ("Conferir",
+             "Acha as pastas que ficaram como “Vazio” mas já têm arquivo "
+             "(o OneDrive às vezes não renomeia) e sugere o nome do cliente "
+             "pelo arquivo .cdr.\n\n“Corrigir todas” mostra a lista antes "
+             "de mudar qualquer coisa.",
+             lambda: (self._ir(gm, a.ABA_CONF), self._clica("conf_botao")),
+             lambda: a._tabs_grupo.tab(a.ABA_CONF)),
+            ("Relatório",
+             "A situação do mês em números. Clique num card (ex.: “sem "
+             "arte”) para ver só aquelas pastas — o CSV exporta o que "
+             "estiver filtrado.",
+             lambda: (self._ir(gm, a.ABA_REL), self._clica("rel_botao")),
+             "rel_cartoes"),
+            ("Buscar",
+             "Acha qualquer pasta pelo código ou pelo nome do cliente, em "
+             "todos os grupos.",
+             None, "hdr_buscar"),
+            ("Configurações e ajuda",
+             "⚙ liga ou desliga Trello e OneDrive.\nⓘ traz este tour de "
+             "volta e a lista de atalhos (F1).\n\nPronto! Os grupos de "
+             "exemplo vão ser apagados agora.",
+             None, ("hdr_config", "hdr_info")),
+        ]
+
+    # ── ciclo ────────────────────────────────────────────────────────────────
+    def comecar(self):
+        self.ativo = True
+        self._cria_exemplos()
+        self._roteiro = self.passos()
+        app = self.app
+        for _ in range(4):
+            b = tk.Toplevel(app, bg=ACCENT, bd=0, highlightthickness=0)
+            b.overrideredirect(True)
+            b.transient(app)            # fica sempre acima da janela do app
+            b.withdraw()
+            self._barras.append(b)
+        self._monta_balao()
+        self._binds = [
+            ("<Configure>", app.bind("<Configure>", self._mexeu, add="+")),
+            ("<Unmap>", app.bind("<Unmap>", self._minimizou, add="+")),
+            ("<Map>", app.bind("<Map>", self._voltou, add="+")),
+            ("<Escape>", app.bind("<Escape>", lambda e: self.terminar(),
+                                  add="+")),
+        ]
+        self.ir_para(0)
+
+    def _monta_balao(self):
+        bal = ctk.CTkToplevel(self.app, fg_color=BG_CARD)
+        bal.overrideredirect(True)
+        bal.transient(self.app)
+        bal.withdraw()
+        caixa = ctk.CTkFrame(bal, fg_color=BG_CARD, corner_radius=0,
+                             border_width=2, border_color=ACCENT)
+        caixa.pack(fill="both", expand=True)
+        self._lbl_passo = ctk.CTkLabel(caixa, text="", text_color=FG_DIM,
+                                       font=F(10))
+        self._lbl_passo.pack(anchor="w", padx=16, pady=(12, 0))
+        self._lbl_titulo = ctk.CTkLabel(caixa, text="", text_color=FG_MAIN,
+                                        font=F(15, True), anchor="w")
+        self._lbl_titulo.pack(anchor="w", padx=16)
+        self._lbl_texto = ctk.CTkLabel(caixa, text="", text_color=FG_LABEL,
+                                       font=F(12), justify="left",
+                                       wraplength=340, anchor="w")
+        self._lbl_texto.pack(anchor="w", padx=16, pady=(6, 10))
+        rod = ctk.CTkFrame(caixa, fg_color="transparent")
+        rod.pack(fill="x", padx=12, pady=(0, 12))
+        ctk.CTkButton(rod, text="Pular tour", width=90, height=30,
+                      corner_radius=8, fg_color="transparent",
+                      hover_color=BG_HOVER, text_color=FG_DIM, font=F(11),
+                      command=self.terminar).pack(side="left")
+        self._b_prox = ctk.CTkButton(rod, text="Próximo →", width=110,
+                                     height=30, corner_radius=8,
+                                     fg_color=ACCENT, hover_color=ACCENT_H,
+                                     text_color=DARK_TXT, font=F(12, True),
+                                     command=self.avancar)
+        self._b_prox.pack(side="right")
+        self._b_ant = ctk.CTkButton(rod, text="← Anterior", width=100,
+                                    height=30, corner_radius=8,
+                                    fg_color=BG_INPUT, hover_color=BG_HOVER,
+                                    text_color=FG_LABEL, font=F(11),
+                                    command=self.voltar)
+        self._b_ant.pack(side="right", padx=(0, 6))
+        bal.bind("<Escape>", lambda e: self.terminar())
+        self._balao = bal
+
+    def avancar(self):
+        if self.i + 1 >= len(self._roteiro):
+            self.terminar()
+        else:
+            self.ir_para(self.i + 1)
+
+    def voltar(self):
+        if self.i > 0:
+            self.ir_para(self.i - 1)
+
+    def ir_para(self, i):
+        if not self.ativo:
+            return
+        self.i = i
+        titulo, texto, preparar, _alvo = self._roteiro[i]
+        n = len(self._roteiro)
+        self._lbl_passo.configure(text=f"{i + 1} de {n}")
+        self._lbl_titulo.configure(text=titulo)
+        self._lbl_texto.configure(text=texto)
+        self._b_ant.configure(state="normal" if i > 0 else "disabled")
+        self._b_prox.configure(text="Concluir ✓" if i == n - 1
+                               else "Próximo →")
+        if preparar is not None:
+            try:
+                preparar()
+            except Exception:
+                pass
+        # espera a tela nova se acomodar antes de medir a área
+        self._agenda(160)
+
+    def _widgets_alvo(self):
+        alvo = self._roteiro[self.i][3]
+        if callable(alvo):
+            try:
+                alvo = alvo()
+            except Exception:
+                alvo = None
+        nomes = alvo if isinstance(alvo, tuple) else (alvo,)
+        out = []
+        for a in nomes:
+            w = self.app.alvo(a) if isinstance(a, str) else a
+            try:
+                if w is not None and w.winfo_exists() and w.winfo_ismapped():
+                    out.append(w)
+            except Exception:
+                pass
+        return out
+
+    def _agenda(self, ms=60):
+        if self._job:
+            try:
+                self.app.after_cancel(self._job)
+            except Exception:
+                pass
+        self._job = self.app.after(ms, self._posiciona)
+
+    def _mexeu(self, ev):
+        if ev.widget is self.app and self.ativo:
+            self._agenda(80)
+
+    def _minimizou(self, ev):
+        if ev.widget is self.app and self.ativo:
+            for w in self._barras + [self._balao]:
+                w.withdraw()
+
+    def _voltou(self, ev):
+        if ev.widget is self.app and self.ativo:
+            self._agenda(120)
+
+    def _posiciona(self):
+        self._job = None
+        if not self.ativo:
+            return
+        app = self.app
+        try:
+            app.update_idletasks()
+            ax, ay = app.winfo_rootx(), app.winfo_rooty()
+            aw, ah = app.winfo_width(), app.winfo_height()
+        except Exception:
+            return
+        ws = self._widgets_alvo()
+        m = self.MOLDURA
+        if ws:
+            x0 = min(w.winfo_rootx() for w in ws)
+            y0 = min(w.winfo_rooty() for w in ws)
+            x1 = max(w.winfo_rootx() + w.winfo_width() for w in ws)
+            y1 = max(w.winfo_rooty() + w.winfo_height() for w in ws)
+            x0, y0, x1, y1 = x0 - 4, y0 - 4, x1 + 4, y1 + 4
+            geos = [(x1 - x0 + 2 * m, m, x0 - m, y0 - m),
+                    (x1 - x0 + 2 * m, m, x0 - m, y1),
+                    (m, y1 - y0, x0 - m, y0),
+                    (m, y1 - y0, x1, y0)]
+            for b, (w, h, x, y) in zip(self._barras, geos):
+                b.geometry(f"{max(1, w)}x{max(1, h)}+{x}+{y}")
+                b.deiconify()
+                b.lift()
+        else:
+            for b in self._barras:
+                b.withdraw()
+        bal = self._balao
+        bal.update_idletasks()
+        bw, bh = bal.winfo_reqwidth(), bal.winfo_reqheight()
+        if ws:
+            gap = 14
+            bx = min(max(x0, ax + 12), ax + aw - bw - 12)
+            if y1 + gap + bh <= ay + ah - 8:
+                by = y1 + gap                               # embaixo
+            elif y0 - gap - bh >= ay + 8:
+                by = y0 - gap - bh                          # em cima
+            elif x1 + gap + bw <= ax + aw - 8:
+                bx, by = x1 + gap, max(ay + 8, y0)          # à direita
+            else:                                           # dentro, no canto
+                bx = max(ax + 12, x1 - bw - 18)
+                by = max(ay + 12, y1 - bh - 18)
+        else:
+            bx = ax + (aw - bw) // 2
+            by = ay + (ah - bh) // 2
+        bal.geometry(f"+{int(bx)}+{int(by)}")
+        bal.deiconify()
+        bal.lift()
+
+    def terminar(self):
+        if not self.ativo:
+            return
+        self.ativo = False
+        app = self.app
+        if self._job:
+            try:
+                app.after_cancel(self._job)
+            except Exception:
+                pass
+        for seq, fid in self._binds:
+            try:
+                app.unbind(seq, fid)
+            except Exception:
+                pass
+        for w in self._barras + [self._balao]:
+            try:
+                w.destroy()
+            except Exception:
+                pass
+        self._barras, self._balao = [], None
+        self._apaga_exemplos()
+        app.show_home()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2770,15 +3719,31 @@ class App(ctk.CTk):
         super().__init__(fg_color=BG_MAIN)
         self.config_data = load_config()
         self.index_data  = load_index()
+        self._limpa_sobras_do_tour()
+
+        self._desfazer          = []   # ações no disco que o Ctrl+Z desfaz
+        self._ouvintes_desfazer = []
+        self._pend_cache        = {}   # pendências dos cards da home
+        self._pend_fila         = []
+        self._pend_rodando      = False
+        self._tour_alvos        = {}   # áreas da tela que o tour destaca
+        self._tour              = None
+        self._campos_filtro     = []
+        self._paleta            = None
 
         self.watcher_active     = False
         self._watcher_processed = set()
+        self._watcher_pendentes = {}   # card → (tentativas, próxima tentativa)
+        self._watcher_fila      = queue.Queue()
+        self._watcher_job       = None
         self._watcher_lines     = []
         self._watcher_tb        = None
+        self._job_indice        = None
+        self._indexando         = False
+        self._renomear_termo    = None
 
         self.title(f"{APP_NAME} v{APP_VERSION}")
-        self.geometry("1120x740")
-        self.minsize(960, 640)
+        self._ajusta_janela_a_tela()
 
         # ícone da janela (o CustomTkinter agenda o dele — reaplicamos o nosso)
         self._apply_icon()
@@ -2792,6 +3757,14 @@ class App(ctk.CTk):
         self.container = ctk.CTkFrame(self, fg_color=BG_MAIN, corner_radius=0)
         self.container.pack(fill="both", expand=True)
         self.show_home()
+
+        # atalhos que valem em qualquer tela (pelo código da tecla: funcionam
+        # com Caps Lock e em qualquer layout de teclado)
+        self.bind("<Control-KeyPress>", self._atalho_global, add="+")
+        self.bind("<F1>", lambda e: self.open_atalhos())
+        self.bind("<Alt-Left>", lambda e: self.show_home())
+        # busca e Ctrl+K em dia sem ninguém clicar em "Atualizar índice"
+        self.after(4000, self._indice_automatico)
 
         if CONFIG_LOAD_WARNING:
             self.after(600, lambda: messagebox.showwarning(
@@ -2817,6 +3790,16 @@ class App(ctk.CTk):
     # ═════════════════════════════════════════════════════════════════════════
     # ASSISTENTE DE PRIMEIRA ABERTURA
     # ═════════════════════════════════════════════════════════════════════════
+    def _ajusta_janela_a_tela(self):
+        """1120x740 cabe folgado num monitor comum, mas não num notebook
+        1366x768 com escala de 125% (vira 1400x925 de verdade). Aqui o tamanho
+        e o mínimo nunca passam da área útil da tela."""
+        w, h, mw, mh = tamanho_janela(
+            self.winfo_screenwidth(), self.winfo_screenheight(),
+            ctk.ScalingTracker.get_window_scaling(self))
+        self.minsize(mw, mh)
+        self.geometry(f"{w}x{h}")
+
     def em_segundo_plano(self, tarefa, quando_pronto, ao_progredir=None):
         """Roda `tarefa()` fora da interface e entrega o resultado a
         `quando_pronto` na thread principal. Usa fila porque chamar `after()`
@@ -2873,7 +3856,7 @@ class App(ctk.CTk):
 
         passo = [0]
         resp = {"onedrive": bool(onedrive_roots()), "trello": False,
-                "modelo": None, "base": ""}
+                "modelo": None, "base": "", "oferecer_tour": True}
 
         corpo = ctk.CTkFrame(win, fg_color="transparent")
         corpo.pack(fill="both", expand=True, padx=28, pady=(24, 8))
@@ -3034,6 +4017,16 @@ class App(ctk.CTk):
         self.aplica_preferencias()
         win.destroy()
         self.show_home()
+        if resp.get("oferecer_tour"):
+            self.after(400, self._oferece_tour)
+
+    def _oferece_tour(self):
+        if messagebox.askyesno(
+                "Conhecer o app",
+                "Quer conhecer o FolderFlow em 1 minuto?\n\n"
+                "O tour usa pastas de exemplo temporárias — nada seu é "
+                "mexido. Dá para rever depois pelo ⓘ no canto de cima."):
+            self.iniciar_tour()
 
     # ── helpers ──────────────────────────────────────────────────────────────
     def _apply_icon(self):
@@ -3045,12 +4038,6 @@ class App(ctk.CTk):
             pass
 
     def _clear(self):
-        # atalhos globais são religados por cada tela; sem isso o Ctrl+K da
-        # home continuava ativo (e apontando para um campo destruído)
-        try:
-            self.unbind_all("<Control-k>")
-        except Exception:
-            pass
         for w in self.container.winfo_children():
             w.destroy()
 
@@ -3059,6 +4046,588 @@ class App(ctk.CTk):
 
     def save(self):
         save_config(self.config_data)
+
+    # ── índice de busca ──────────────────────────────────────────────────────
+    def _agenda_salvar_indice(self):
+        """Grava o índice fora da tela, juntando mudanças seguidas numa
+        gravação só (antes: uma gravação inteira, na tela, por pasta)."""
+        if self._job_indice:
+            try:
+                self.after_cancel(self._job_indice)
+            except Exception:
+                pass
+        self._job_indice = self.after(800, self._salva_indice_agora)
+
+    def _salva_indice_agora(self):
+        self._job_indice = None
+        copia = dict(self.index_data)       # a thread grava uma foto dele
+        self.em_segundo_plano(lambda: save_index(copia), lambda _r: None)
+
+    def _indice_automatico(self, forcar=False):
+        """Relê as pastas de todos os grupos em segundo plano ao abrir o app
+        — no máximo a cada 12 horas, para não pesar no OneDrive."""
+        ultimo = self.config_data.get("indice_em") or 0
+        if self._indexando or (not forcar and self.index_data
+                               and time.time() - ultimo < 12 * 3600):
+            return
+        self._indexando = True
+        grupos = [dict(g) for g in self.groups()]
+
+        def tarefa():
+            idx = build_index(grupos)
+            save_index(idx)
+            return idx
+
+        def pronto(idx):
+            self._indexando = False
+            if isinstance(idx, dict) and not ("erro" in idx and len(idx) == 1):
+                self.index_data = idx
+                self.config_data["indice_em"] = time.time()
+                self.save()
+        self.em_segundo_plano(tarefa, pronto)
+
+    def _alvo(self, nome, widget):
+        """Registra uma área da tela (o tour e a paleta chegam nela)."""
+        self._tour_alvos[nome] = widget
+        return widget
+
+    def alvo(self, nome):
+        w = self._tour_alvos.get(nome)
+        try:
+            return w if w is not None and w.winfo_exists() else None
+        except Exception:
+            return None
+
+    # ── desfazer (Ctrl+Z) das ações no disco ─────────────────────────────────
+    def registrar_desfazer(self, rotulo, desfaz):
+        """`desfaz()` devolve (pastas_afetadas, erro_ou_None)."""
+        self._desfazer.append({"rotulo": rotulo, "desfaz": desfaz})
+        del self._desfazer[:-20]
+        self._avisa_desfazer()
+
+    def proximo_desfazer(self):
+        return self._desfazer[-1]["rotulo"] if self._desfazer else None
+
+    def desfazer(self):
+        """Desfaz a última ação no disco. Devolve (pastas, texto)."""
+        if not self._desfazer:
+            return [], "Nada para desfazer."
+        acao = self._desfazer.pop()
+        try:
+            pastas, erro = acao["desfaz"]()
+        except Exception as e:
+            pastas, erro = [], str(e)
+        self._avisa_desfazer()
+        if erro:
+            return pastas, f"⚠ Não deu para desfazer “{acao['rotulo']}”: {erro}"
+        return pastas, f"↶ Desfeito: {acao['rotulo']}"
+
+    def _avisa_desfazer(self):
+        vivos = []
+        for f in self._ouvintes_desfazer:
+            try:
+                if f():            # o ouvinte devolve False quando morreu
+                    vivos.append(f)
+            except Exception:
+                pass
+        self._ouvintes_desfazer = vivos
+
+    # ── atalhos globais ──────────────────────────────────────────────────────
+    def _atalho_global(self, ev):
+        kc = ev.keycode
+        if kc == 75:                                   # Ctrl+K
+            self.open_paleta()
+            return "break"
+        if kc == 70:                                   # Ctrl+F
+            return "break" if self.foca_filtro() else None
+        if 49 <= kc <= 53:                             # Ctrl+1…5
+            tabs = getattr(self, "_tabs_grupo", None)
+            try:
+                if tabs is not None and tabs.winfo_exists():
+                    nomes = list(tabs._tab_dict)
+                    if kc - 49 < len(nomes):
+                        tabs.set(nomes[kc - 49])
+                        return "break"
+            except Exception:
+                pass
+        return None
+
+    def foca_filtro(self):
+        """Ctrl+F: vai para o campo de filtro da tela visível."""
+        vivos = []
+        for e in self._campos_filtro:
+            try:
+                if e.winfo_exists():
+                    vivos.append(e)
+            except Exception:
+                pass
+        self._campos_filtro = vivos
+        for e in vivos:
+            if e.winfo_ismapped():
+                e.focus_set()
+                e.select_range(0, "end")
+                return True
+        return False
+
+    def _campo_filtro(self, parent, tree):
+        """Campo fixo 'Filtrar… (Ctrl+F)' ligado a uma árvore. Fica sempre
+        no lugar (nunca aparece nem some), então nada muda de posição."""
+        caixa = ctk.CTkFrame(parent, fg_color="transparent")
+        # sem textvariable: com ela o CTkEntry não mostra o texto de dica
+        ent = ctk.CTkEntry(caixa, width=170, height=28,
+                           placeholder_text="Filtrar…  (Ctrl+F)",
+                           fg_color=BG_INPUT, border_color=BORDER,
+                           text_color=FG_MAIN, corner_radius=8, font=F(11))
+        ent.pack(side="right")
+        cont = ctk.CTkLabel(caixa, text="", text_color=FG_DIM, font=F(10),
+                            width=90, anchor="e")
+        cont.pack(side="right", padx=(0, 6))
+        job = [None]
+
+        def _aplica():
+            job[0] = None
+            if not tree.winfo_exists():
+                return
+            tree.set_filtro(ent.get())
+            n = tree.n_encontrados
+            cont.configure(text="" if n is None else
+                           ("nada encontrado" if n == 0 else
+                            f"{n} encontrado{'s' if n > 1 else ''}"))
+
+        def _mudou(ev=None):
+            if ev is not None and getattr(ev, "keysym", "") in (
+                    "Escape", "Down", "Return", "Up"):
+                return
+            if job[0]:
+                self.after_cancel(job[0])
+            job[0] = self.after(150, _aplica)
+
+        def _limpa(_e=None):
+            ent.delete(0, "end")
+            _aplica()
+            tree.canvas.focus_set()
+            return "break"
+
+        def _desce(_e=None):
+            tree.canvas.focus_set()
+            linhas = [r for r in tree.rows() if r.payload is not None]
+            if linhas and not tree.selection():
+                tree.select_key(linhas[-1].key if tree.n_encontrados else
+                                linhas[0].key)
+            return "break"
+        ent.bind("<KeyRelease>", _mudou)
+        ent.bind("<Escape>", _limpa)
+        ent.bind("<Down>", _desce)
+        ent.bind("<Return>", _desce)
+        self._campos_filtro.append(ent)
+        caixa.entry = ent
+        return caixa
+
+    # ── paleta de comandos (Ctrl+K) ──────────────────────────────────────────
+    def _abre_aba(self, g, aba, conferir=False):
+        self.show_group(g)
+        try:
+            self._tabs_grupo.set(aba)
+        except Exception:
+            return
+        if conferir:
+            b = self.alvo("conf_botao")
+            if b is not None:
+                self.after(150, b.invoke)
+
+    def _comandos_paleta(self):
+        cmds = []
+        for g in self.groups():
+            nome = g.get("name") or "(sem nome)"
+            cmds.append((f"📁  Ir para: {nome}",
+                         lambda g=g: self.show_group(g)))
+            if g["kind"] == "marketplace":
+                cmds.append((f"➕  Criar pastas — {nome}",
+                             lambda g=g: self._abre_aba(g, self.ABA_CRIAR)))
+            else:
+                cmds.append((f"🧩  Modelo — {nome}",
+                             lambda g=g: self._abre_aba(g, self.ABA_MODELO)))
+            cmds.append((f"🔍  Conferir — {nome}",
+                         lambda g=g: self._abre_aba(g, self.ABA_CONF, True)))
+        cmds += [
+            ("＋  Novo grupo", lambda: self.open_group_editor(None)),
+            ("⤒  Importar grupo…", self.importar_grupo),
+            ("⌕  Buscar pastas", self.show_search),
+            ("⚙  Configurações", self.open_settings),
+            ("⌨  Atalhos do teclado", self.open_atalhos),
+            ("🧭  Conhecer o app", self.iniciar_tour),
+            ("⌂  Início", self.show_home),
+        ]
+        return cmds
+
+    def _resultados_paleta(self, texto):
+        palavras = _norm(texto).split()
+        cmds = self._comandos_paleta()
+        if not palavras:
+            return cmds[:8]
+        achados = [c for c in cmds if all(p in _norm(c[0]) for p in palavras)]
+        pastas = []
+        for k, v in self.index_data.items():
+            alvo = _norm(f"{k} {v.get('nome', '')}")
+            if all(p in alvo for p in palavras):
+                caminho = v.get("path", "")
+                pastas.append((f"📂  {v.get('nome') or k}",
+                               lambda c=caminho: abrir_no_explorer(
+                                   c, mesma_janela=False)))
+                if len(pastas) >= 5:
+                    break
+        return (achados + pastas)[:8]
+
+    def open_paleta(self):
+        if self._paleta is not None:
+            try:
+                if self._paleta.winfo_exists():
+                    self._paleta.focus_force()
+                    return self._paleta
+            except Exception:
+                pass
+        win = ctk.CTkToplevel(self, fg_color=BG_CARD)
+        win.overrideredirect(True)
+        win.transient(self)
+        larg = 580
+        x = self.winfo_rootx() + max(0, (self.winfo_width() - larg) // 2)
+        y = self.winfo_rooty() + 64
+        win.geometry(f"{larg}x{8 * 36 + 96}+{x}+{y}")
+        self._paleta = win
+        box = ctk.CTkFrame(win, fg_color=BG_CARD, corner_radius=0,
+                           border_width=1, border_color=BORDER_S)
+        box.pack(fill="both", expand=True)
+        # sem textvariable: com ela o CTkEntry não mostra o texto de dica
+        ent = ctk.CTkEntry(box, height=40,
+                           placeholder_text="Grupo, comando ou código de pasta…",
+                           fg_color=BG_INPUT, border_color=ACCENT,
+                           text_color=FG_MAIN, font=F(13), corner_radius=8)
+        ent.pack(fill="x", padx=10, pady=(10, 6))
+        lista = ctk.CTkFrame(box, fg_color="transparent")
+        lista.pack(fill="both", expand=True, padx=8)
+        ctk.CTkLabel(box, text="↑↓ escolher  ·  Enter executar  ·  Esc fechar",
+                     text_color=FG_DIM, font=F(10)
+                     ).pack(anchor="e", padx=12, pady=(0, 6))
+        # 8 linhas fixas, só troca o texto: nada é criado/destruído ao digitar
+        linhas = []
+        for i in range(8):
+            l = ctk.CTkLabel(lista, text="", anchor="w", height=34,
+                             corner_radius=6, fg_color="transparent",
+                             text_color=FG_MAIN, font=F(12))
+            l.pack(fill="x", pady=1)
+            for w in (l, getattr(l, "_label", l)):
+                w.bind("<Button-1>", lambda e, i=i: _executa(i))
+            linhas.append(l)
+        estado = {"res": [], "sel": 0}
+
+        def _pinta():
+            for i, l in enumerate(linhas):
+                if i < len(estado["res"]):
+                    l.configure(text="  " + estado["res"][i][0],
+                                fg_color=ACCENT_DK if i == estado["sel"]
+                                else "transparent")
+                else:
+                    l.configure(text="", fg_color="transparent")
+
+        def _atualiza(ev=None):
+            if ev is not None and getattr(ev, "keysym", "") in (
+                    "Up", "Down", "Return", "Escape"):
+                return                  # navegar não refaz a busca
+            estado["res"] = self._resultados_paleta(ent.get())
+            estado["sel"] = 0
+            if not estado["res"]:
+                linhas[0].configure(text="  nada encontrado",
+                                    fg_color="transparent")
+                for l in linhas[1:]:
+                    l.configure(text="", fg_color="transparent")
+                return
+            _pinta()
+
+        def _move(d):
+            if estado["res"]:
+                estado["sel"] = (estado["sel"] + d) % len(estado["res"])
+                _pinta()
+            return "break"
+
+        def _fecha(_e=None):
+            self._paleta = None
+            try:
+                win.destroy()
+            except Exception:
+                pass
+            return "break"
+
+        def _executa(i=None):
+            i = estado["sel"] if i is None else i
+            if 0 <= i < len(estado["res"]):
+                acao = estado["res"][i][1]
+                _fecha()
+                self.after(10, acao)
+            return "break"
+
+        def _perdeu_foco(_e=None):
+            def _confere():
+                try:
+                    f = self.focus_get()
+                except Exception:
+                    f = None
+                if win.winfo_exists() and (f is None or
+                                           not str(f).startswith(str(win))):
+                    _fecha()
+            self.after(120, _confere)
+
+        def _digita(texto):
+            ent.delete(0, "end")
+            ent.insert(0, texto)
+            _atualiza()
+
+        ent.bind("<KeyRelease>", _atualiza)
+        ent.bind("<Down>", lambda e: _move(1))
+        ent.bind("<Up>", lambda e: _move(-1))
+        ent.bind("<Return>", lambda e: _executa())
+        ent.bind("<Escape>", _fecha)
+        win.bind("<FocusOut>", _perdeu_foco)
+        win.paleta = {"digita": _digita, "executa": _executa, "fecha": _fecha,
+                      "resultados": lambda: [r[0] for r in estado["res"]]}
+        _atualiza()
+        win.after(30, lambda: (win.focus_force(), ent.focus_set()))
+        return win
+
+    # ── tela de atalhos (F1) ─────────────────────────────────────────────────
+    ATALHOS = [
+        ("Em qualquer tela", [
+            ("Ctrl+K", "Paleta: ir para grupo, conferir, buscar pasta…"),
+            ("F1", "Esta tela de atalhos"),
+            ("Alt+←", "Voltar ao início"),
+            ("Ctrl+1 … 5", "Trocar de aba dentro do grupo"),
+            ("Ctrl+F", "Filtrar a lista da tela"),
+        ]),
+        ("Pastas (explorador)", [
+            ("Ctrl+C / Ctrl+X", "Copiar / recortar (vale no Explorador)"),
+            ("Ctrl+V", "Colar na pasta selecionada"),
+            ("Ctrl+Z", "Desfazer renomear, colar ou criar"),
+            ("F2", "Renomear"),
+            ("Del", "Mandar para a Lixeira"),
+            ("Ctrl+N", "Nova pasta"),
+            ("Ctrl+Shift+N", "Novo arquivo"),
+            ("Ctrl+A", "Selecionar tudo"),
+            ("F5", "Reler o disco"),
+            ("Enter / duplo clique", "Abrir o arquivo no programa dele"),
+            ("← →", "Recolher / abrir a pasta"),
+        ]),
+        ("Modelo (construtor)", [
+            ("Ctrl+C / X / V", "Copiar, recortar e colar partes do modelo"),
+            ("Ctrl+D", "Duplicar"),
+            ("Ctrl+Z", "Desfazer a última mudança no modelo"),
+            ("F2", "Renomear"),
+            ("Del", "Excluir do modelo"),
+            ("Ctrl+N / Ctrl+Shift+N", "Nova pasta / novo arquivo"),
+        ]),
+    ]
+
+    def open_atalhos(self):
+        win = ctk.CTkToplevel(self, fg_color=BG_MAIN)
+        win.title("Atalhos do teclado")
+        win.geometry("760x560")
+        win.transient(self)
+        ctk.CTkLabel(win, text="⌨  Atalhos do teclado", text_color=FG_MAIN,
+                     font=F(18, True)).pack(anchor="w", padx=22, pady=(18, 10))
+        corpo = ctk.CTkFrame(win, fg_color="transparent")
+        corpo.pack(fill="both", expand=True, padx=16)
+        corpo.grid_columnconfigure((0, 1), weight=1, uniform="c")
+        colunas = [[self.ATALHOS[0], self.ATALHOS[2]], [self.ATALHOS[1]]]
+        for ci, secoes in enumerate(colunas):
+            col = ctk.CTkFrame(corpo, fg_color="transparent")
+            col.grid(row=0, column=ci, sticky="nsew", padx=6)
+            for titulo, itens in secoes:
+                card = ctk.CTkFrame(col, fg_color=BG_CARD, corner_radius=12)
+                card.pack(fill="x", pady=(0, 10))
+                ctk.CTkLabel(card, text=titulo.upper(), text_color=FG_LABEL,
+                             font=F(10, True)).pack(anchor="w", padx=14,
+                                                    pady=(10, 4))
+                for tecla, oque in itens:
+                    ln = ctk.CTkFrame(card, fg_color="transparent")
+                    ln.pack(fill="x", padx=14, pady=2)
+                    ctk.CTkLabel(ln, text=tecla, text_color=ACCENT,
+                                 font=F(11, True), width=128,
+                                 anchor="w").pack(side="left")
+                    ctk.CTkLabel(ln, text=oque, text_color=FG_MAIN, font=F(11),
+                                 anchor="w", justify="left",
+                                 wraplength=200).pack(side="left", fill="x")
+                ctk.CTkFrame(card, fg_color="transparent",
+                             height=6).pack()
+        ctk.CTkButton(win, text="Fechar", height=34, width=100,
+                      corner_radius=10, fg_color=ACCENT, hover_color=ACCENT_H,
+                      text_color=DARK_TXT, font=F(12, True),
+                      command=win.destroy).pack(anchor="e", padx=22,
+                                                pady=(0, 16))
+        win.bind("<Escape>", lambda e: win.destroy())
+        win.after(60, lambda: win.winfo_exists() and win.lift())
+        return win
+
+    def open_menu_info(self, botao=None):
+        """ⓘ do cabeçalho: tour, atalhos e sobre."""
+        itens = [("🧭  Conhecer o app", self.iniciar_tour, True),
+                 ("⌨  Atalhos do teclado        F1", self.open_atalhos, True),
+                 None,
+                 ("ℹ  Sobre o FolderFlow", self.open_sobre, True)]
+        if not hasattr(self, "_menu_info"):
+            self._menu_info = ContextMenu(self)
+        b = botao or self._btn_info
+        self._menu_info.show(itens, b.winfo_rootx() - 150,
+                             b.winfo_rooty() + b.winfo_height() + 4)
+
+    # ── exportar / importar grupo ────────────────────────────────────────────
+    def exportar_grupo(self, g, caminho=None, parent=None):
+        if caminho is None:
+            caminho = filedialog.asksaveasfilename(
+                parent=parent or self, defaultextension=".json",
+                initialfile=f"grupo {_sanitiza_nome(g.get('name') or 'grupo')}.json",
+                filetypes=[("Grupo do FolderFlow", "*.json")])
+        if not caminho:
+            return None
+        dados = {"folderflow_grupo": 1, "versao_app": APP_VERSION,
+                 "grupo": {k: v for k, v in g.items()
+                           if not k.startswith("_") and k != "tour"}}
+        try:
+            with open(caminho, "w", encoding="utf-8") as f:
+                json.dump(dados, f, ensure_ascii=False, indent=2)
+        except OSError as e:
+            messagebox.showerror("Exportar grupo", str(e), parent=parent)
+            return None
+        messagebox.showinfo(
+            "Exportar grupo", f"✓ Grupo salvo em:\n{caminho}\n\nNo outro PC, "
+                              "use “⤒ Importar” na tela inicial.", parent=parent)
+        return caminho
+
+    def importar_grupo(self, caminho=None):
+        if caminho is None:
+            caminho = filedialog.askopenfilename(
+                parent=self, filetypes=[("Grupo do FolderFlow", "*.json")])
+        if not caminho:
+            return None
+        try:
+            with open(caminho, encoding="utf-8") as f:
+                dados = json.load(f)
+            gi = dados["grupo"]
+            if gi.get("kind") not in ("template", "marketplace"):
+                raise ValueError("tipo de grupo desconhecido")
+        except Exception as e:
+            messagebox.showerror("Importar grupo",
+                                 f"Este arquivo não é um grupo do FolderFlow.\n\n{e}")
+            return None
+        g = default_group(gi["kind"])
+        g.update(gi)
+        g["id"] = uuid.uuid4().hex[:8]
+        g.pop("tour", None)
+        nomes = {x.get("name") for x in self.groups()}
+        nome = g.get("name") or "Grupo importado"
+        if nome in nomes:
+            nome = f"{nome} (importado)"
+            i = 2
+            while nome in nomes:
+                nome = f"{g.get('name')} (importado {i})"
+                i += 1
+        g["name"] = nome
+        base = g.get("base_path") or ""
+        if base and not os.path.isdir(base):
+            g["base_path"] = ""
+            if messagebox.askyesno(
+                    "Importar grupo",
+                    f"A pasta base deste grupo não existe neste PC:\n{base}\n\n"
+                    "Escolher a pasta base agora?"):
+                p = filedialog.askdirectory(parent=self)
+                if p:
+                    g["base_path"] = os.path.normpath(p)
+        faltando = []
+        try:
+            for n in _iter_nodes(parse_template(g.get("template") or "")):
+                if n["type"] == "copy" and not os.path.isfile(n.get("src", "")):
+                    faltando.append(n.get("src", ""))
+        except TemplateError:
+            pass
+        self.config_data["groups"].append(g)
+        self.save()
+        self.show_group(g)
+        if faltando:
+            messagebox.showwarning(
+                "Importar grupo",
+                "Estes anexos do modelo não existem neste PC — ajuste na aba "
+                "Modelo (botão direito → Trocar arquivo de origem):\n\n" +
+                "\n".join("  • " + f for f in faltando[:8]))
+        return g
+
+    # ── pendências nos cards da home ─────────────────────────────────────────
+    def pendencias_grupo(self, g, quando_pronto):
+        """Conta, em segundo plano e um grupo por vez, o que falta resolver.
+        Resultado em cache por 2 minutos."""
+        chave = g.get("id") or g.get("name")
+        c = self._pend_cache.get(chave)
+        if c and time.time() - c[0] < 120:
+            quando_pronto(c[1])
+            return
+        self._pend_fila.append((g, chave, quando_pronto))
+        self._roda_pendencias()
+
+    def _roda_pendencias(self):
+        if self._pend_rodando or not self._pend_fila:
+            return
+        g, chave, cb = self._pend_fila.pop(0)
+        self._pend_rodando = True
+
+        def tarefa():
+            if g["kind"] == "marketplace":
+                agora = datetime.datetime.now()
+                r = conferir_pastas(g, str(agora.year), MESES[agora.month - 1])
+            else:
+                r = conferir_pasta(
+                    g.get("base_path", ""),
+                    provisorios=g.get("provisorios") or PROVISORIOS_PADRAO,
+                    usa_enviar=g.get("usa_enviar", False),
+                    prefixo=g.get("prefix", ""))
+            cont = {}
+            for it in r.get("itens", []):
+                cont[it["estado"]] = cont.get(it["estado"], 0) + 1
+            cont["duplicado"] = len(r.get("duplicados", []))
+            return cont
+
+        def pronto(cont):
+            self._pend_rodando = False
+            if isinstance(cont, dict) and "erro" not in cont:
+                self._pend_cache[chave] = (time.time(), cont)
+                try:
+                    cb(cont)
+                except Exception:
+                    pass
+            self._roda_pendencias()
+        base = g.get("base_path", "")
+        if not base or not os.path.isdir(base):
+            pronto({})
+            return
+        self.em_segundo_plano(tarefa, pronto)
+
+    # ── tour ─────────────────────────────────────────────────────────────────
+    def _limpa_sobras_do_tour(self):
+        """Se o app fechou no meio do tour, tira os grupos de exemplo."""
+        gs = self.config_data.get("groups", [])
+        sobras = [x for x in gs if x.get("tour")]
+        if not sobras:
+            return
+        tmp = os.path.normcase(os.path.abspath(tempfile.gettempdir()))
+        for x in sobras:
+            gs.remove(x)
+            raiz = x.get("tour_raiz") or ""
+            r = os.path.normcase(os.path.abspath(raiz)) if raiz else ""
+            if r and r.startswith(tmp + os.sep):
+                shutil.rmtree(raiz, ignore_errors=True)
+        save_config(self.config_data)
+
+    def iniciar_tour(self):
+        if self._tour is not None and self._tour.ativo:
+            return self._tour
+        self._tour = Tour(self)
+        self._tour.comecar()
+        return self._tour
 
     # ── Header ───────────────────────────────────────────────────────────────
     def _build_header(self):
@@ -3112,14 +4681,19 @@ class App(ctk.CTk):
                 self._nav_btns[nav_key] = b
             return b
 
-        hbtn("ⓘ", self.open_sobre).pack(side="right", padx=2)
-        hbtn("⚙", self.open_settings).pack(side="right", padx=2)
+        self._btn_info = hbtn("ⓘ", lambda: self.open_menu_info())
+        self._btn_info.pack(side="right", padx=2)
+        Tooltip(self._btn_info, "Conhecer o app · Atalhos · Sobre")
+        self._alvo("hdr_info", self._btn_info)
+        self._alvo("hdr_config", hbtn("⚙", self.open_settings))
+        self._tour_alvos["hdr_config"].pack(side="right", padx=2)
         # o watcher é uma engrenagem do Trello: some para quem não usa
         self._watcher_chip = hbtn("○ watcher", self.open_watcher, width=90)
         if self.usa("trello"):
             self._watcher_chip.pack(side="right", padx=2)
-        hbtn("⌕  Buscar", self.show_search, width=92,
-             nav_key="buscar").pack(side="right", padx=3)
+        self._alvo("hdr_buscar", hbtn("⌕  Buscar", self.show_search, width=92,
+                                      nav_key="buscar")).pack(side="right",
+                                                              padx=3)
         hbtn("⌂  Início", self.show_home, width=86,
              nav_key="inicio").pack(side="right", padx=3)
 
@@ -3177,9 +4751,9 @@ class App(ctk.CTk):
         bar = ctk.CTkFrame(wrap, fg_color="transparent")
         bar.pack(fill="x", pady=(12, 8))
 
-        filtro_var = tk.StringVar()
-        busca = ctk.CTkEntry(bar, textvariable=filtro_var, width=240, height=34,
-                             placeholder_text="Filtrar grupos…   (Ctrl+K)",
+        # sem textvariable: com ela o CTkEntry não mostra o texto de dica
+        busca = ctk.CTkEntry(bar, width=240, height=34,
+                             placeholder_text="Filtrar grupos…",
                              fg_color=BG_NODE, border_color=BORDER,
                              text_color=FG_MAIN, corner_radius=10, font=F(12))
         busca.pack(side="left")
@@ -3199,8 +4773,17 @@ class App(ctk.CTk):
                       font=F(12, True),
                       command=lambda: self.open_group_editor(None)
                       ).pack(side="right")
+        b_imp = ctk.CTkButton(bar, text="⤒ Importar", height=36, width=100,
+                              corner_radius=10, fg_color=BG_INPUT,
+                              hover_color=BG_HOVER, text_color=FG_LABEL,
+                              font=F(12), command=self.importar_grupo)
+        b_imp.pack(side="right", padx=(0, 8))
+        Tooltip(b_imp, "Trazer um grupo exportado de outro PC (.json)")
+        ctk.CTkLabel(bar, text="Ctrl+K  paleta de comandos", text_color=FG_DIM,
+                     font=F(10)).pack(side="left", padx=(12, 0))
 
         grid = ctk.CTkScrollableFrame(wrap, fg_color="transparent")
+        self._alvo("home_grade", grid)
         grid.pack(fill="both", expand=True)
         grid.grid_columnconfigure((0, 1, 2), weight=1, uniform="col")
 
@@ -3212,7 +4795,7 @@ class App(ctk.CTk):
                 gs.sort(key=lambda x: (x.get("name") or "").lower())
             else:
                 gs = list(reversed(gs))
-            termo = filtro_var.get().strip().lower()
+            termo = busca.get().strip().lower()
             if termo:
                 gs = [x for x in gs if termo in (x.get("name") or "").lower()]
             if self.config_data.get("home_sort") != sort_var.get():
@@ -3226,10 +4809,8 @@ class App(ctk.CTk):
                 self._group_card(grid, g).grid(
                     row=i // 3, column=i % 3, sticky="nsew", padx=7, pady=7)
 
-        filtro_var.trace_add("write", _render)
-        self.bind_all("<Control-k>",
-                      lambda e: busca.focus_set()
-                      if busca.winfo_exists() else None)
+        busca.bind("<KeyRelease>", _render)
+        self._campos_filtro.append(busca)       # Ctrl+F cai aqui na home
         _render()
 
     def _home_empty(self, wrap):
@@ -3443,6 +5024,35 @@ class App(ctk.CTk):
         ctk.CTkLabel(inner, text=("📁 " if ok else "⚠ ") + base,
                      text_color=FG_DIM, font=F(10), anchor="w"
                      ).pack(fill="x", pady=(4, 0))
+        # pendências: o espaço já nasce reservado (altura fixa), então o card
+        # não pula quando a contagem chega do segundo plano
+        pend = ctk.CTkLabel(inner, text="", text_color=YELLOW, font=F(10, True),
+                            anchor="w", height=18)
+        pend.pack(fill="x", pady=(2, 0))
+        card.pendencias = pend
+
+        def _mostra_pend(cont):
+            try:
+                if not pend.winfo_exists():
+                    return
+            except Exception:
+                return
+            corrigir = cont.get("nao_renomeada", 0)
+            partes = []
+            if corrigir:
+                partes.append(f"🟡 {corrigir} para corrigir")
+            if cont.get("duplicado"):
+                partes.append(f"⚠ {cont['duplicado']} nº repetido")
+            if g["kind"] == "marketplace" and cont.get("sem_arquivo"):
+                partes.append(f"{cont['sem_arquivo']} sem arte")
+            pend.configure(text=" · ".join(partes),
+                           cursor="hand2" if partes else "")
+            if partes:
+                Tooltip(pend, "Pendências do mês atual — clique para conferir"
+                        if g["kind"] == "marketplace" else
+                        "Pastas provisórias com arquivo — clique para conferir")
+        if ok:
+            self.after(50, lambda: self.pendencias_grupo(g, _mostra_pend))
 
         # rodapé com ações claras
         foot = ctk.CTkFrame(inner, fg_color="transparent")
@@ -3469,9 +5079,18 @@ class App(ctk.CTk):
                 pass
         clickables = [card, inner, top] + [
             w for w in (*inner.winfo_children(), *top.winfo_children())
-            if w not in (btn_edit, btn_del, top, foot)]
+            if w not in (btn_edit, btn_del, top, foot, pend)]
         for w in clickables:
             w.bind("<Button-1>", _open)
+
+        def _abre_conferir(_e=None):
+            if pend.cget("text"):
+                self._abre_aba(g, self.ABA_CONF, conferir=True)
+            else:
+                _open()
+        for w in (pend, getattr(pend, "_label", pend)):
+            w.bind("<Button-1>", _abre_conferir)
+        self._alvo(f"card_{g.get('id')}", card)
         for w in (card, inner, top, foot):
             w.bind("<Enter>", lambda e: _hover(True))
             w.bind("<Leave>", lambda e: _hover(False))
@@ -3505,6 +5124,7 @@ class App(ctk.CTk):
             return
         # só mexe no OneDrive se a pasta realmente estiver dentro de um
         pause = (self.config_data.get("pause_onedrive", True)
+                 and self.usa("onedrive")
                  and path_no_onedrive(base) is not None)
         extra = "\n\nO OneDrive será pausado durante a criação." if pause else ""
         if not messagebox.askyesno(
@@ -3763,7 +5383,17 @@ class App(ctk.CTk):
             _atualiza()
 
         def _aplicar():
-            feitos, erros = aplicar_rename(dir_pai, pares_atuais[0])
+            pares = pares_atuais[0]
+            feitos, erros = aplicar_rename(dir_pai, pares)
+            # guarda o que de fato mudou (o nome novo existe no disco)
+            mudou = [(os.path.join(dir_pai, n), os.path.join(dir_pai, a))
+                     for a, n, p in pares if n != a and p is None
+                     and os.path.exists(os.path.join(dir_pai, n))]
+            if mudou:
+                self.registrar_desfazer(
+                    f"renomear {len(mudou)} item(ns) em "
+                    f"“{os.path.basename(dir_pai) or dir_pai}”",
+                    lambda: desfaz_renomes(mudou))
             win.destroy()
             if depois:
                 depois()
@@ -3905,8 +5535,13 @@ class App(ctk.CTk):
         acoes = ctk.CTkFrame(vis_container, fg_color="transparent")
         acoes.pack(fill="x", padx=8, pady=(8, 4))
 
+        filtro_m = ctk.CTkFrame(vis_container, fg_color="transparent")
+        filtro_m.pack(fill="x", padx=8, pady=(0, 4))
         tree = TreeCanvas(vis_container)
+        tree.filtro_expande = True        # no modelo, procura também no fechado
         tree.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+        self._campo_filtro(filtro_m, tree).pack(side="right")
+        self._alvo("modelo_construtor", vis_container)
 
         def _find_parent_list(alvo):
             """Lista que contém este nó (comparando por identidade)."""
@@ -4007,6 +5642,9 @@ class App(ctk.CTk):
                      lambda: _seq_popover(add_to=state_nodes), True),
                     ("📎 Anexar arquivo na raiz",
                      lambda: _add_copy(state_nodes), True),
+                    None,
+                    ("📋 Colar na raiz              Ctrl+V",
+                     lambda: _colar_no(state_nodes), _tem_no_copiado()),
                 ]
             n = row.payload
             é_pasta = n["type"] == "folder"
@@ -4015,6 +5653,13 @@ class App(ctk.CTk):
                  lambda: tree.begin_edit(), True),
                 ("⧉  Duplicar                   Ctrl+D",
                  lambda: _acao("duplicate"), True),
+                None,
+                ("✂  Recortar                   Ctrl+X",
+                 lambda: _copiar_no(True), True),
+                ("⧉  Copiar                     Ctrl+C",
+                 lambda: _copiar_no(False), True),
+                ("📋  Colar                      Ctrl+V",
+                 lambda: _colar_no(), _tem_no_copiado()),
             ]
             if é_pasta:
                 itens += [
@@ -4051,6 +5696,79 @@ class App(ctk.CTk):
             _acao({"delete": "delete", "duplicate": "duplicate",
                    "badge": "badge"}.get(acao_id, acao_id))
         tree.on_action = _on_action
+
+        # ── Ctrl+C / X / V no modelo: vale entre pastas e entre grupos, e o
+        # trecho vai também como texto (dá para colar no modo Texto)
+        def _copiar_no(recortar=False):
+            n = _sel_node()
+            if n is None:
+                return
+            copia = json.loads(json.dumps(
+                {k: v for k, v in n.items() if not k.startswith("_")}))
+            txt = serialize_template([copia])
+            self._clip_modelo, self._clip_modelo_txt = [copia], txt
+            self.clipboard_clear()
+            self.clipboard_append(txt)
+            if recortar:
+                lista = _find_parent_list(n)
+                for i, x in enumerate(lista):
+                    if x is n:
+                        del lista[i]
+                        break
+                _sync_visual()
+                _schedule_refresh()
+
+        def _tem_no_copiado():
+            try:
+                txt = self.clipboard_get()
+            except tk.TclError:
+                return False
+            return bool(getattr(self, "_clip_modelo", None)) and \
+                txt == getattr(self, "_clip_modelo_txt", None)
+
+        def _colar_no(destino=None):
+            if not _tem_no_copiado():
+                return
+            destino = _destino_para_novos() if destino is None else destino
+            novos = [json.loads(json.dumps(n)) for n in self._clip_modelo]
+            destino.extend(novos)
+            _sync_visual()
+            _schedule_refresh()
+            tree.select_key(_prov._uid(novos[0]))
+            tree.scroll_to(_prov._uid(novos[0]))
+
+        # ── Ctrl+Z no modelo: pilha com os textos anteriores (até 20) ────────
+        hist_modelo, desfazendo = [], [False]
+
+        def _desfaz_modelo():
+            if not hist_modelo:
+                return
+            txt = hist_modelo.pop()
+            try:
+                nodes = parse_template(txt)
+            except TemplateError:
+                return
+            desfazendo[0] = True
+            state_nodes[:] = nodes
+            if mode[0] == "text":
+                editor.delete("1.0", "end")
+                editor.insert("1.0", txt)
+            _sync_visual()
+            _refresh()
+            desfazendo[0] = False
+
+        def _atalho_modelo(nome, shift):
+            if nome in ("copy", "cut"):
+                _copiar_no(nome == "cut")
+            elif nome == "paste":
+                _colar_no()
+            elif nome == "new":
+                _acao("file" if shift else "folder")
+            elif nome == "undo":
+                _desfaz_modelo()
+            elif nome == "find":
+                self.foca_filtro()
+        tree.on_shortcut = _atalho_modelo
 
         def _on_activate(row):
             n = row.payload
@@ -4318,6 +6036,7 @@ class App(ctk.CTk):
                                   font=F(12, True))
         btn_criar.pack(side="right")
         Tooltip(btn_criar, "Cria no disco tudo o que está na pré-visualização")
+        self._alvo("modelo_previa", tree_box)
 
         prev_wrap = ctk.CTkFrame(tree_box, fg_color="transparent")
         prev_wrap.pack(fill="both", expand=True, padx=16, pady=(4, 12))
@@ -4584,6 +6303,9 @@ class App(ctk.CTk):
                 return
             status_lbl.configure(text="✓ modelo válido", text_color=GREEN)
             if text != g.get("template"):
+                if not desfazendo[0] and g.get("template") is not None:
+                    hist_modelo.append(g["template"])
+                    del hist_modelo[:-20]
                 g["template"] = text
                 self.save()
             _rebuild_vars(nodes)
@@ -4753,11 +6475,17 @@ class App(ctk.CTk):
 
         for nome, _f in construtores:
             tabs.add(nome)
-        orig_set = tabs.set
-
         def _set(nome):
+            # não usa o set() do CTkTabview: ele esconde as outras abas 100ms
+            # DEPOIS, e duas trocas seguidas (abrir o grupo já numa aba, pela
+            # paleta ou pelo card) deixavam a tela em branco
             _garante(nome)
-            orig_set(nome)
+            if nome not in tabs._tab_dict:
+                raise ValueError(f"aba inexistente: {nome}")
+            tabs._current_name = nome
+            tabs._segmented_button.set(nome)
+            tabs._grid_forget_all_tabs(exclude_name=nome)
+            tabs._set_grid_current_tab()
         tabs.set = _set
         tabs.configure(command=lambda: _garante(tabs.get()))
         inicial = self.ABA_PASTAS if g.get("base_path") else (
@@ -4787,12 +6515,36 @@ class App(ctk.CTk):
         status = ctk.CTkLabel(wrap, text="", text_color=FG_DIM, font=F(11),
                               anchor="w", justify="left")
         status.pack(fill="x", pady=(4, 0))
+        self._alvo("pastas_arvore", caixa)
+        self._alvo("pastas_barra", barra)
+        self._alvo("pastas_status", status)
+        # barra de status: avisos de ação ("✓ colado") ficam 3s antes de a
+        # seleção voltar a mostrar caminho e tamanho
+        aviso_ate = [0.0]
+        _mostra_status = status.configure
+
+        def _avisa(**kw):
+            aviso_ate[0] = time.time() + 3
+            _mostra_status(**kw)
+        status.configure = _avisa
         prov = [None]
+        adiado = [False]
 
         def recarrega(_path=None):
-            if disco.winfo_exists():
-                disco.reload()
-                _atualiza_icone()
+            if not disco.winfo_exists():
+                return
+            if disco.ocupado():
+                # renomeando (F2) ou arrastando: troca as linhas depois
+                if not adiado[0]:
+                    adiado[0] = True
+                    self.after(400, _tenta_de_novo)
+                return
+            disco.reload()
+            _atualiza_icone()
+
+        def _tenta_de_novo():
+            adiado[0] = False
+            recarrega()
 
         def monta():
             p = DiskTreeProvider(base_g, on_ready=recarrega, after=self.after)
@@ -4801,18 +6553,20 @@ class App(ctk.CTk):
             disco.set_all_expanded(False)
             if disco.rows():
                 disco.toggle(0)                # abre a pasta base
+            DiskWatch(disco, p)
 
         def sel_paths():
             return [r.payload for r in disco.selection() if r.payload]
 
-        def atualizar(*paths):
+        def atualizar(*paths, depois=None):
+            """Relê em segundo plano (só as pastas afetadas, se informadas)
+            e troca de uma vez — sem 'carregando…' piscando."""
+            self._pend_cache.pop(g.get("id"), None)   # card da home em dia
             if prov[0]:
-                if paths:
-                    for p in paths:
-                        prov[0].invalidate(p)
-                else:
-                    prov[0].invalidate()
-            recarrega()
+                prov[0].refresh(list(paths) if paths else None, force=True,
+                                depois=depois)
+            else:
+                recarrega()
 
         def pasta_alvo():
             sel = disco.selected_row()
@@ -4850,7 +6604,8 @@ class App(ctk.CTk):
                 messagebox.showwarning("Excluir", f"{ok_n} item(ns) na Lixeira."
                                        "\n\nProblemas:\n" + "\n".join(erros[:6]))
             else:
-                status.configure(text=f"✓ {ok_n} item(ns) na Lixeira.",
+                status.configure(text=f"✓ {ok_n} item(ns) na Lixeira "
+                                      "(para voltar, restaure pela Lixeira).",
                                  text_color=GREEN)
 
         def renomear_um():
@@ -4874,9 +6629,20 @@ class App(ctk.CTk):
             except OSError as e:
                 messagebox.showerror("Renomear", str(e))
                 return
-            atualizar(os.path.dirname(antigo))
-            status.configure(text=f"✓ Renomeado para '{limpo}'.",
-                             text_color=GREEN)
+            # o que estava aberto dentro dela continua aberto com o nome novo
+            k_old = os.path.normcase(os.path.abspath(antigo))
+            k_new = os.path.normcase(os.path.abspath(alvo))
+            for k in list(disco._expanded):
+                if k == k_old or k.startswith(k_old + os.sep):
+                    disco._expanded.discard(k)
+                    disco._expanded.add(k_new + k[len(k_old):])
+            self.registrar_desfazer(
+                f"renomear “{os.path.basename(antigo)}” → “{limpo}”",
+                lambda: desfaz_renomes([(alvo, antigo)]))
+            atualizar(os.path.dirname(antigo),
+                      depois=lambda: disco.select_key(k_new))
+            status.configure(text=f"✓ Renomeado para '{limpo}'.  "
+                                  "Ctrl+Z desfaz.", text_color=GREEN)
         disco.on_rename = on_rename
 
         def nova(tipo):
@@ -4897,12 +6663,17 @@ class App(ctk.CTk):
             except OSError as e:
                 messagebox.showerror("Criar", str(e))
                 return
+            self.registrar_desfazer(f"criar “{os.path.basename(destino)}”",
+                                    lambda: desfaz_criacao(destino))
             disco._expanded.add(os.path.normcase(os.path.abspath(pai)))
-            atualizar(pai)
             chave = os.path.normcase(os.path.abspath(destino))
-            self.after(350, lambda: (disco.select_key(chave),
-                                     disco.scroll_to(chave),
-                                     disco.begin_edit()))
+
+            def _edita_nova():
+                disco.reload()
+                disco.select_key(chave)
+                disco.scroll_to(chave)
+                disco.begin_edit()
+            atualizar(pai, depois=_edita_nova)
 
         def renomear_massa():
             rows = disco.selection()
@@ -4963,13 +6734,139 @@ class App(ctk.CTk):
                 self.clipboard_append("\n".join(p))
                 status.configure(text="✓ Caminho copiado.", text_color=GREEN)
 
+        # ── Ctrl+C / Ctrl+X / Ctrl+V — a mesma área de transferência do
+        # Explorador: copia aqui e cola lá, e vice-versa
+        seq_recorte = [None]
+
+        def copiar(recortar=False):
+            paths = sel_paths()
+            if not paths:
+                return
+            if not clipboard_escrever_arquivos(paths, recortar,
+                                               hwnd=self.winfo_id()):
+                status.configure(text="⚠ Não consegui usar a área de "
+                                      "transferência. Tente de novo.",
+                                 text_color=RED)
+                return
+            disco.recortados = {r.key for r in disco.selection()} \
+                if recortar else set()
+            seq_recorte[0] = clipboard_sequencia() if recortar else None
+            disco._redraw()
+            n = len(paths)
+            status.configure(
+                text=(f"✂ {n} item(ns) recortado(s)" if recortar else
+                      f"📋 {n} item(ns) copiado(s)") +
+                     " — cole numa pasta daqui ou no Explorador (Ctrl+V).",
+                text_color=FG_LABEL)
+
+        def _confere_recorte():
+            # outro programa usou a área de transferência: o recorte acabou
+            if disco.recortados and seq_recorte[0] != clipboard_sequencia():
+                disco.recortados = set()
+                seq_recorte[0] = None
+                disco._redraw()
+
+        def colar():
+            _confere_recorte()
+            origens, mover = clipboard_ler_arquivos()
+            if not origens:
+                status.configure(text="A área de transferência não tem "
+                                      "arquivos nem pastas para colar.",
+                                 text_color=FG_DIM)
+                return
+            destino = pasta_alvo()
+            if not destino or not os.path.isdir(destino):
+                return
+            verbo = "Movendo" if mover else "Colando"
+
+            def progresso(p):
+                i, total, nome = p
+                if status.winfo_exists():
+                    status.configure(text=f"{verbo} {i}/{total} — {nome}",
+                                     text_color=FG_LABEL)
+
+            def pronto(res):
+                if not disco.winfo_exists():
+                    return
+                if isinstance(res, dict):
+                    messagebox.showerror("Colar", res["erro"])
+                    return
+                novos, erros = res
+                feitos = [p for p in pares
+                          if os.path.normcase(p[0]) != os.path.normcase(p[1])]
+                if feitos:
+                    n = len(feitos)
+                    self.registrar_desfazer(
+                        f"{'mover' if mover else 'colar'} {n} item(ns) em "
+                        f"“{os.path.basename(destino) or destino}”",
+                        lambda: desfaz_colagem(feitos, mover))
+                if mover:
+                    disco.recortados = set()
+                    seq_recorte[0] = None
+                    if novos and not erros:
+                        clipboard_limpar()   # como o Explorador: recorte usado
+                afetadas = {destino} | ({os.path.dirname(o) for o in origens}
+                                        if mover else set())
+                disco._expanded.add(os.path.normcase(os.path.abspath(destino)))
+
+                def seleciona():
+                    disco.reload()
+                    chaves = [os.path.normcase(os.path.abspath(n))
+                              for n in novos]
+                    if chaves:
+                        disco._sel = chaves
+                        disco._anchor = chaves[0]
+                        disco.scroll_to(chaves[0])
+                        _sel(disco.selection())
+                    if erros:
+                        messagebox.showwarning(
+                            "Colar", f"{len(novos)} item(ns) colado(s).\n\n"
+                                     "Problemas:\n" + "\n".join(erros[:8]))
+                    else:
+                        status.configure(
+                            text=f"✓ {len(novos)} item(ns) "
+                                 f"{'movido(s)' if mover else 'colado(s)'} em "
+                                 f"“{os.path.basename(destino) or destino}”.",
+                            text_color=GREEN)
+                atualizar(*afetadas, depois=seleciona)
+
+            pares = []
+            self.em_segundo_plano(
+                lambda avisa: colar_itens(origens, destino, mover, avisa,
+                                          pares=pares),
+                pronto, ao_progredir=progresso)
+
+        def desfazer_ui():
+            pastas, msg = self.desfazer()
+            cor = (RED if msg.startswith("⚠") else
+                   FG_DIM if msg.startswith("Nada") else GREEN)
+            status.configure(text=msg, text_color=cor)
+            if pastas:
+                atualizar(*pastas)
+
+        def atalho(nome, shift):
+            if nome == "copy":
+                copiar(False)
+            elif nome == "cut":
+                copiar(True)
+            elif nome == "paste":
+                colar()
+            elif nome == "new":
+                nova("file" if shift else "folder")
+            elif nome == "undo":
+                desfazer_ui()
+            elif nome == "find":
+                self.foca_filtro()
+        disco.on_shortcut = atalho
+        disco.canvas.bind("<FocusIn>", lambda e: _confere_recorte(), add="+")
+
         def dbtn(texto, cmd, dica, largura=34):
             b = ctk.CTkButton(barra, text=texto, width=largura, height=28,
                               corner_radius=8, fg_color=BG_INPUT,
                               hover_color=BG_HOVER, text_color=FG_LABEL,
                               font=F(11), command=cmd)
             b.pack(side="left", padx=(0, 5))
-            Tooltip(b, dica)
+            b.dica = Tooltip(b, dica)
             return b
 
         dbtn("📁 Nova pasta", lambda: nova("folder"), "Nova pasta (Ctrl+N)", 104)
@@ -4981,6 +6878,22 @@ class App(ctk.CTk):
         dbtn("🗑", excluir, "Mandar para a Lixeira (Del)").configure(text_color=RED)
         dbtn("📂", abrir, "Abrir no Explorador")
         dbtn("🔄", lambda: atualizar(), "Reler o disco (F5)")
+        b_desf = dbtn("↶", desfazer_ui, "Nada para desfazer")
+        dica_d = b_desf.dica
+
+        def _ouve_desfazer():
+            try:
+                if not b_desf.winfo_exists():
+                    return False
+            except Exception:
+                return False
+            prox = self.proximo_desfazer()
+            b_desf.configure(state="normal" if prox else "disabled")
+            dica_d.text = (f"Desfazer: {prox}  (Ctrl+Z)" if prox
+                           else "Nada para desfazer")
+            return True
+        self._ouvintes_desfazer.append(_ouve_desfazer)
+        _ouve_desfazer()
         icone = IconeRecolher(barra, bg=BG_CARD)
         icone.pack(side="left", padx=(6, 0))
         dica_ic = Tooltip(icone, "Recolher tudo")
@@ -5004,13 +6917,20 @@ class App(ctk.CTk):
                 disco.reload()
             _atualiza_icone()
         icone.command = _alterna
-        ctk.CTkLabel(barra, text=base_g, text_color=FG_DIM, font=F(10)
-                     ).pack(side="right")
+        filtro = self._campo_filtro(barra, disco)
+        filtro.pack(side="right")
+        self._alvo("pastas_filtro", filtro)
 
         def ctx(row, sel):
             itens = [
                 ("📂  Abrir no Explorador", abrir, bool(sel)),
-                ("📋  Copiar caminho", copiar_caminho, bool(sel)),
+                None,
+                ("✂  Recortar                   Ctrl+X",
+                 lambda: copiar(True), bool(sel)),
+                ("⧉  Copiar                     Ctrl+C",
+                 lambda: copiar(False), bool(sel)),
+                ("📋  Colar aqui                 Ctrl+V", colar, True),
+                ("🔗  Copiar caminho", copiar_caminho, bool(sel)),
                 None,
                 ("＋ 📁  Nova pasta aqui", lambda: nova("folder"), True),
                 ("＋ 📄  Novo arquivo aqui", lambda: nova("file"), True),
@@ -5048,17 +6968,75 @@ class App(ctk.CTk):
         disco.canvas.bind("<F5>", lambda e: atualizar())
         disco.canvas.bind("<Control-n>", lambda e: nova("folder"))
 
+        def _enter(_e=None):
+            r = disco.selected_row()
+            if r is not None:
+                if r.expandable:
+                    disco.toggle(disco.rows().index(r))
+                else:
+                    ativar(r)
+            return "break"
+        disco.canvas.bind("<Return>", _enter)
+
+        # ── barra de status: caminho, quantidade e tamanho da seleção ──────
+        gen_tam = [0]
+
+        def _tamanho(paths, limite=20000):
+            """Roda em segundo plano. Para em `limite` arquivos."""
+            total, n, mais = 0, 0, False
+            for p in paths:
+                if os.path.isfile(p):
+                    try:
+                        total += os.path.getsize(p)
+                    except OSError:
+                        pass
+                    continue
+                for raiz, _dirs, arqs in os.walk(p):
+                    for a in arqs:
+                        n += 1
+                        if n > limite:
+                            return total, True
+                        try:
+                            total += os.path.getsize(os.path.join(raiz, a))
+                        except OSError:
+                            pass
+            return total, mais
+
         def _sel(rows):
-            if not rows:
-                status.configure(text="", text_color=FG_DIM)
-            elif len(rows) == 1:
-                status.configure(text=rows[0].payload or "", text_color=FG_DIM)
-            else:
-                status.configure(text=f"{len(rows)} itens selecionados",
-                                 text_color=FG_LABEL)
+            gen_tam[0] += 1
+            gen = gen_tam[0]
+            if time.time() < aviso_ate[0]:
+                return                      # deixa o aviso da ação à mostra
+            paths = [r.payload for r in rows if r.payload]
+            if not paths:
+                n = sum(1 for r in disco.rows() if r.depth == 1 and r.payload)
+                _mostra_status(text=f"{n} itens  ·  {base_g}", text_color=FG_DIM)
+                return
+            rotulo = (paths[0] if len(paths) == 1
+                      else f"{len(paths)} itens selecionados")
+            if all(os.path.isfile(p) for p in paths):
+                t, _m = _tamanho(paths)
+                _mostra_status(text=f"{rotulo}  ·  {fmt_tamanho(t)}",
+                               text_color=FG_DIM)
+                return
+            _mostra_status(text=f"{rotulo}  ·  calculando tamanho…",
+                           text_color=FG_DIM)
+
+            def pronto(r):
+                if gen != gen_tam[0] or not isinstance(r, tuple):
+                    return                  # a seleção mudou: resultado velho
+                try:
+                    if status.winfo_exists() and time.time() >= aviso_ate[0]:
+                        _mostra_status(
+                            text=f"{rotulo}  ·  {'mais de ' if r[1] else ''}"
+                                 f"{fmt_tamanho(r[0])}", text_color=FG_DIM)
+                except Exception:
+                    pass
+            self.em_segundo_plano(lambda: _tamanho(paths), pronto)
         disco.on_select = _sel
         monta()
         _atualiza_icone()
+        self.after(600, lambda: disco.winfo_exists() and _sel(disco.selection()))
 
     def _escopo_row(self, parent, g):
         """O que conferir: um mês (marketplace) ou uma pasta (estrutura).
@@ -5183,6 +7161,8 @@ class App(ctk.CTk):
                                  hover_color=ACCENT_H, text_color=DARK_TXT,
                                  font=F(12, True))
         btn_conf.pack(side="left")
+        self._alvo("conf_botao", btn_conf)
+        self._alvo("conf_topo", topo)
         btn_corrigir = ctk.CTkButton(topo, text="✔ Corrigir todas", height=36,
                                      width=140, corner_radius=10,
                                      fg_color=SEQ_BG, border_width=1,
@@ -5224,10 +7204,13 @@ class App(ctk.CTk):
                 w.destroy()
             estado["linhas"].clear()
 
+        esc_atual = ["mes"]
+
         def _conferir():
             _limpa()
             btn_conf.configure(state="disabled", text="Conferindo...")
             esc = escopo()
+            esc_atual[0] = esc["tipo"]
             self.em_segundo_plano(lambda: self._roda_conferencia(g, esc),
                                   _mostrar)
 
@@ -5255,12 +7238,32 @@ class App(ctk.CTk):
             _cartao(resumo, "não renomeadas", cont["nao_renomeada"],
                     CORES["nao_renomeada"])
 
+            if r.get("duplicados"):
+                grupos_d = "\n".join("   • " + "  e  ".join(nomes)
+                                     for nomes in r["duplicados"][:6])
+                ctk.CTkLabel(
+                    corpo,
+                    text="⚠ Número repetido no mês — provavelmente duas "
+                         "pessoas criaram lote ao mesmo tempo. Renomeie uma "
+                         "delas para um número livre:\n" + grupos_d,
+                    text_color=YELLOW, font=F(11), justify="left",
+                    wraplength=760).pack(anchor="w", padx=10, pady=(8, 4))
+
             pend = [i for i in itens if i["estado"] == "nao_renomeada"]
             btn_corrigir.configure(
                 state="normal" if pend else "disabled",
                 text=f"✔ Corrigir todas ({len(pend)})" if pend
-                     else "✔ Corrigir todas")
+                     else "✔ Nada para corrigir")
 
+            if not pend:
+                onde = "neste mês" if esc_atual[0] == "mes" else "nesta pasta"
+                nome_p = (g.get("provisorios") or PROVISORIOS_PADRAO)[0]
+                ctk.CTkLabel(
+                    corpo,
+                    text=f"✓ Nada para corrigir {onde}: nenhuma pasta "
+                         f"“{nome_p}” tem arquivo dentro.",
+                    text_color=GREEN, font=F(12), justify="left"
+                    ).pack(anchor="w", padx=10, pady=(10, 4))
             if pend:
                 ctk.CTkLabel(
                     corpo,
@@ -5347,10 +7350,11 @@ class App(ctk.CTk):
                               hover_color=ACCENT_H, text_color=DARK_TXT,
                               font=F(11, True))
             b.pack(side="left")
-            b.configure(command=lambda: _corrigir_um(it, sv, ln, b))
+            b.configure(command=lambda: (_corrigir_um(it, sv, ln, b),
+                                         _atualiza_btn_corrigir()))
             estado["linhas"].append((it, sv, ln, b))
 
-        def _corrigir_um(it, sv, ln, btn, silencioso=False):
+        def _corrigir_um(it, sv, ln, btn, silencioso=False, pares=None):
             nome = _sanitiza_nome(sv.get())
             if not nome:
                 if not silencioso:
@@ -5368,6 +7372,13 @@ class App(ctk.CTk):
                 if not silencioso:
                     messagebox.showerror("Corrigir", str(e))
                 return False
+            antigo_path = it["path"]
+            if pares is not None:
+                pares.append((novo, antigo_path))
+            else:
+                self.registrar_desfazer(
+                    f"corrigir “{os.path.basename(antigo_path)}”",
+                    lambda: desfaz_renomes([(novo, antigo_path)]))
             it["path"], it["estado"] = novo, "ok"
             try:
                 btn.configure(text="✓ pronto", state="disabled",
@@ -5375,34 +7386,137 @@ class App(ctk.CTk):
                 ln.configure(border_color=SEQ_BD)
             except Exception:
                 pass
-            # mantém o índice e o Trello em dia, como no fluxo de renomear
-            k = os.path.basename(novo).split(" - ")[0].upper()
-            self.index_data[k] = {
-                "path": novo, "nome": os.path.basename(novo),
-                "cliente": nome, "plat": g["name"].upper(), "codigo": k}
-            save_index(self.index_data)
+            # mantém o índice e o Trello em dia, como no fluxo de renomear.
+            # O índice é gravado depois, fora da tela e uma vez só para o lote
+            indice_troca(self.index_data, antigo_path, novo, g["name"])
+            self._agenda_salvar_indice()
+            self._pend_cache.pop(g.get("id"), None)
             if g["kind"] == "marketplace":
                 self._trello_renomeia_card(g, it["codigo"], nome)
             return True
 
+        def _atualiza_btn_corrigir():
+            n = sum(1 for it, *_r in estado["linhas"]
+                    if it["estado"] == "nao_renomeada")
+            btn_corrigir.configure(
+                state="normal" if n else "disabled",
+                text=f"✔ Corrigir todas ({n})" if n else "✔ Nada para corrigir")
+
         def _corrigir_todas():
+            """Antes de renomear, mostra a lista do que vai mudar: cada linha
+            pode ser desmarcada e o nome ajustado."""
             alvos = [(it, sv, ln, b) for it, sv, ln, b in estado["linhas"]
-                     if it["estado"] == "nao_renomeada" and sv.get().strip()]
+                     if it["estado"] == "nao_renomeada"]
             if not alvos:
+                return
+            win = ctk.CTkToplevel(self)
+            win.title("Revisar correções")
+            win.configure(fg_color=BG_CARD)
+            win.geometry("760x540")
+            win.transient(self)
+            ctk.CTkLabel(win, text="Confira o que vai mudar",
+                         text_color=FG_MAIN, font=F(16, True)
+                         ).pack(anchor="w", padx=18, pady=(16, 2))
+            ctk.CTkLabel(win, text="Desmarque o que não quiser corrigir agora "
+                                   "e ajuste o nome do cliente se precisar.",
+                         text_color=FG_DIM, font=F(11)
+                         ).pack(anchor="w", padx=18)
+            lista = ctk.CTkScrollableFrame(win, fg_color=BG_PANEL,
+                                           corner_radius=10)
+            lista.pack(fill="both", expand=True, padx=18, pady=10)
+            rod = ctk.CTkFrame(win, fg_color="transparent")
+            rod.pack(fill="x", padx=18, pady=(0, 16))
+            b_ap = ctk.CTkButton(rod, text="", height=36, corner_radius=10,
+                                 fg_color=ACCENT, hover_color=ACCENT_H,
+                                 text_color=DARK_TXT, font=F(12, True))
+            b_ap.pack(side="right")
+            linhas, traces = [], []
+
+            def _final(it, nome):
+                n = _sanitiza_nome(nome)
+                return (_sanitiza_nome(nome_corrigido(it, n)) or n) if n else ""
+
+            def _conta(*_):
+                if not b_ap.winfo_exists():
+                    return
+                n = 0
+                for it, sv, var, lbl in linhas:
+                    f = _final(it, sv.get())
+                    lbl.configure(text="→  " + (f or "digite o nome do cliente"),
+                                  text_color=(FG_MAIN if var.get() else FG_DIM)
+                                  if f else RED)
+                    n += bool(var.get() and f)
+                b_ap.configure(
+                    text=f"✔ Aplicar {n} correç{'ão' if n == 1 else 'ões'}",
+                    state="normal" if n else "disabled")
+
+            def _fecha():
+                for sv, tid in traces:
+                    try:
+                        sv.trace_remove("write", tid)
+                    except Exception:
+                        pass
+                win.destroy()
+
+            for it, sv, _ln, _b in alvos:
+                fr = ctk.CTkFrame(lista, fg_color=BG_NODE, corner_radius=8,
+                                  border_width=1, border_color=BORDER)
+                fr.pack(fill="x", pady=3, padx=4)
+                var = tk.BooleanVar(value=bool(sv.get().strip()))
+                ctk.CTkCheckBox(fr, text="", variable=var, width=24,
+                                command=_conta, fg_color=ACCENT,
+                                hover_color=ACCENT_H, border_color=BORDER_S
+                                ).pack(side="left", padx=(10, 2), pady=8)
+                col = ctk.CTkFrame(fr, fg_color="transparent")
+                col.pack(side="left", fill="x", expand=True, pady=6)
+                ctk.CTkLabel(col, text=os.path.basename(it["path"]),
+                             text_color=FG_DIM, font=F(11), anchor="w"
+                             ).pack(fill="x")
+                l2 = ctk.CTkFrame(col, fg_color="transparent")
+                l2.pack(fill="x")
+                ctk.CTkEntry(l2, textvariable=sv, width=230, height=28,
+                             placeholder_text="nome do cliente",
+                             fg_color=BG_INPUT, border_color=BORDER,
+                             text_color=FG_MAIN, font=F(11)
+                             ).pack(side="right", padx=(6, 10))
+                lbl = ctk.CTkLabel(l2, text="", font=F(12, True), anchor="w")
+                lbl.pack(side="left", fill="x", expand=True)
+                linhas.append((it, sv, var, lbl))
+                traces.append((sv, sv.trace_add("write", _conta)))
+
+            def _aplicar():
+                por_it = {id(t[0]): t for t in alvos}
+                escolhidos = [por_it[id(it)] for it, sv, var, _l in linhas
+                              if var.get() and _final(it, sv.get())]
+                _fecha()
+                pares = []
+                feitos = sum(1 for t in escolhidos
+                             if _corrigir_um(*t, silencioso=True, pares=pares))
+                if pares:
+                    self.registrar_desfazer(
+                        f"corrigir {len(pares)} pasta(s)",
+                        lambda: desfaz_renomes(pares))
+                _atualiza_btn_corrigir()
+                falhas = len(escolhidos) - feitos
                 messagebox.showinfo(
                     "Corrigir",
-                    "Nenhuma pasta com nome preenchido para corrigir.")
-                return
-            if not messagebox.askyesno(
-                    "Corrigir todas",
-                    f"Renomear {len(alvos)} pasta(s) com os nomes sugeridos?\n\n"
-                    "As que estiverem em branco são ignoradas."):
-                return
-            feitos = sum(1 for it, sv, ln, b in alvos
-                         if _corrigir_um(it, sv, ln, b, silencioso=True))
-            btn_corrigir.configure(state="disabled")
-            messagebox.showinfo("Corrigir",
-                                f"✓ {feitos} pasta(s) corrigida(s).")
+                    f"✓ {feitos} pasta(s) corrigida(s).\n"
+                    "Para desfazer: ↶ na aba Pastas (Ctrl+Z)." +
+                    (f"\n\n{falhas} não deram certo (já existe uma pasta com "
+                     "esse nome, ou está aberta em outro programa)."
+                     if falhas else ""))
+
+            b_ap.configure(command=_aplicar)
+            ctk.CTkButton(rod, text="Cancelar", height=36, width=110,
+                          corner_radius=10, fg_color=BG_INPUT,
+                          hover_color=BG_HOVER, text_color=FG_LABEL,
+                          font=F(12), command=_fecha
+                          ).pack(side="right", padx=(0, 8))
+            win.protocol("WM_DELETE_WINDOW", _fecha)
+            win.bind("<Escape>", lambda e: _fecha())
+            _conta()
+            win.after(80, lambda: win.winfo_exists() and win.lift())
+            return win
 
         btn_conf.configure(command=_conferir)
         btn_corrigir.configure(command=_corrigir_todas)
@@ -5414,13 +7528,22 @@ class App(ctk.CTk):
             return
 
         def tarefa():
+            # sem ninguém confirmando, só mexe num card que seja claramente o
+            # desse cliente: nome IGUAL e ainda sem código. Um card que já tem
+            # código (o Renomear já atualizou o Trello, só o OneDrive falhou)
+            # ficaria "090004AB - 090004AB - Cliente"
             try:
                 cards = trello_search_cards(nome_cliente, g["board_id"],
                                             cfg["trello_key"], cfg["trello_token"])
-                if len(cards) == 1:
-                    trello_update_card_name(
-                        cards[0]["id"], f"{codigo} - {cards[0]['name']}",
-                        cfg["trello_key"], cfg["trello_token"])
+                alvo = _norm(nome_cliente).strip()
+                iguais = [c for c in cards
+                          if _norm(c.get("name", "")).strip() == alvo]
+                if len(iguais) == 1:
+                    titulo = titulo_card(codigo, iguais[0]["name"])
+                    if titulo:
+                        trello_update_card_name(iguais[0]["id"], titulo,
+                                                cfg["trello_key"],
+                                                cfg["trello_token"])
             except Exception:
                 pass
         threading.Thread(target=tarefa, daemon=True).start()
@@ -5456,6 +7579,7 @@ class App(ctk.CTk):
         # fita de meses: mostra de relance o que já existe, o que passou e o atual
         fita = ctk.CTkFrame(parent, fg_color="transparent")
         fita.pack(fill="x", pady=(0, 4))
+        self._alvo("fita_meses", fita)
         chips, dicas = {}, {}
         for m in MESES:
             b = ctk.CTkButton(fita, text=m[:2], width=30, height=22,
@@ -5564,6 +7688,7 @@ class App(ctk.CTk):
 
         linhas = ctk.CTkFrame(wrap, fg_color="transparent")
         linhas.pack(fill="x")
+        self._alvo("mp_pessoas", linhas)
         pessoas = []
 
         def add_linha(resp="", qtd="1", focar=True):
@@ -5623,15 +7748,16 @@ class App(ctk.CTk):
         dl.pack(fill="x", padx=10, pady=8)
         ctk.CTkLabel(dl, text="Dividir um total:", text_color=FG_LABEL,
                      font=F(11)).pack(side="left", padx=(0, 8))
-        total_var = tk.StringVar()
-        ctk.CTkEntry(dl, textvariable=total_var, width=70, height=28,
-                     placeholder_text="ex: 100", fg_color=BG_INPUT,
-                     border_color=BORDER, text_color=FG_MAIN,
-                     font=F(12)).pack(side="left", padx=(0, 8))
+        # sem textvariable: com ela o CTkEntry não mostra o texto de dica
+        ent_total = ctk.CTkEntry(dl, width=70, height=28,
+                                 placeholder_text="ex: 100", fg_color=BG_INPUT,
+                                 border_color=BORDER, text_color=FG_MAIN,
+                                 font=F(12))
+        ent_total.pack(side="left", padx=(0, 8))
 
         def _dividir():
             try:
-                total = int(total_var.get())
+                total = int(ent_total.get())
                 assert total > 0
             except Exception:
                 messagebox.showwarning("Dividir",
@@ -5718,18 +7844,22 @@ class App(ctk.CTk):
                 Tooltip(b, f"Repete a distribuição do lote de "
                            f"{ult.get('mes', '?')}:\n{resumo_u}")
 
-        od_root = (path_no_onedrive(g.get("base_path", ""))
-                   if self.usa("onedrive") else None)
+        # igual à v1.1.0: quem usa OneDrive vê a opção e ela vem com o padrão
+        # das configurações. Não depende de reconhecer a pasta como OneDrive —
+        # uma biblioteca do SharePoint pode não aparecer como raiz conhecida.
+        usa_od = self.usa("onedrive")
+        od_root = path_no_onedrive(g.get("base_path", "")) if usa_od else None
         pause_var = tk.BooleanVar(
-            value=self.config_data.get("pause_onedrive", True) and bool(od_root))
-        if od_root:
+            value=usa_od and self.config_data.get("pause_onedrive", True))
+        if usa_od:
             sw_od = make_switch(wrap, text="Pausar OneDrive durante criação",
                                 variable=pause_var, progress_color=ACCENT,
                                 text_color=FG_LABEL, font=F(12))
             sw_od.pack(anchor="w", pady=(0, 8))
-            Tooltip(sw_od, "Esta pasta fica dentro do OneDrive:\n"
-                           f"{od_root}\n\nFecha o OneDrive durante a criação "
-                           "e reabre no fim.")
+            Tooltip(sw_od, ("Esta pasta fica dentro do OneDrive:\n"
+                            f"{od_root}\n\n" if od_root else "") +
+                    "Fecha o OneDrive durante a criação e reabre no fim "
+                    "(mais rápido e evita conflito de sincronização).")
 
         out = make_textbox(wrap, height=130)
 
@@ -5782,11 +7912,14 @@ class App(ctk.CTk):
             btn.configure(state="disabled", text="Criando...")
             ano, mes, pausar = ano_var.get(), mes_var.get(), pause_var.get()
 
+            criadas = []
+
             def tarefa(avisa):
                 # o log vai pela fila: quem escreve na tela é a thread principal
                 def log_seguro(msg, erro=False, aviso=False, ok=False):
                     avisa((msg, erro, aviso, ok))
-                n = criar_lote(g, ano, mes, itens, log_seguro, pausar)
+                n = criar_lote(g, ano, mes, itens, log_seguro, pausar,
+                               criadas=criadas)
                 if n:
                     registrar_lote(g["name"], ano, mes, itens)
                 return n
@@ -5805,6 +7938,12 @@ class App(ctk.CTk):
                     return
                 if out.winfo_exists():
                     log_fn(f"{n} pasta(s) criada(s) com sucesso!", ok=True)
+                # as pastas novas já entram na busca e no Ctrl+K
+                for p in criadas:
+                    indice_troca(self.index_data, None, p, g["name"])
+                if criadas:
+                    self._agenda_salvar_indice()
+                self._pend_cache.pop(g.get("id"), None)
                 if n:
                     self._concluido(f"✓ {n} pasta(s) criada(s) em:\n{destino}",
                                     destino)
@@ -5828,8 +7967,8 @@ class App(ctk.CTk):
                      font=F(11, True)).pack(anchor="w", pady=(2, 3))
         busca_row = ctk.CTkFrame(wrap, fg_color="transparent")
         busca_row.pack(fill="x")
-        termo_var = tk.StringVar()
-        ent_busca = ctk.CTkEntry(busca_row, textvariable=termo_var, height=34,
+        # sem textvariable: com ela o CTkEntry não mostra o texto de dica
+        ent_busca = ctk.CTkEntry(busca_row, height=34,
                                  placeholder_text="ex.: 090012IB  ou  padaria",
                                  fg_color=BG_INPUT, border_color=BORDER,
                                  text_color=FG_MAIN, font=F(12))
@@ -5933,15 +8072,18 @@ class App(ctk.CTk):
             inteiro_var.set(not tem_cod)
             _prev_nome()
 
-        def _mostra_resultados(paths):
+        def _mostra_resultados(paths, termo=""):
             btn_loc.configure(state="normal", text="🔍 Localizar")
             for w in lista.winfo_children():
                 w.destroy()
             if isinstance(paths, dict):
                 paths = []
             if not paths:
-                ctk.CTkLabel(lista, text="Nada encontrado com esse termo.",
-                             text_color=YELLOW, font=F(11)).pack(pady=14)
+                aviso = ctk.CTkLabel(lista, text="Nada encontrado neste grupo. "
+                                                 "Procurando nos outros…",
+                                     text_color=YELLOW, font=F(11))
+                aviso.pack(pady=(14, 4))
+                _procura_nos_outros(termo, aviso)
                 return
             base = g.get("base_path", "")
             for p in paths:
@@ -5956,8 +8098,45 @@ class App(ctk.CTk):
             if len(paths) == 1:
                 _seleciona(paths[0])
 
+        def _procura_nos_outros(termo, aviso):
+            """A v1.1.0 procurava o código nas duas bases (Shopee e ML) de uma
+            vez. Aqui cada grupo tem sua aba — então, se não achar neste,
+            procura nos outros e oferece abrir lá."""
+            outros = [x for x in self.groups() if x is not g
+                      and x.get("base_path") and os.path.isdir(x["base_path"])]
+
+            def tarefa():
+                for x in outros:
+                    achados = buscar_pastas(x["base_path"], termo, limite=5)
+                    if achados:
+                        return x, achados
+                return None
+
+            def pronto(r):
+                if not aviso.winfo_exists():
+                    return
+                if not r or isinstance(r, dict):
+                    aviso.configure(text="Nada encontrado com esse termo.")
+                    return
+                x, achados = r
+                aviso.configure(text=f"Não está neste grupo — achei "
+                                     f"{len(achados)} no grupo “{x['name']}”:"
+                                     f"  {os.path.basename(achados[0])}")
+
+                def _abre_la():
+                    self._renomear_termo = termo
+                    self._abre_aba(x, self.ABA_REN)
+                ctk.CTkButton(lista, text=f"Abrir no grupo {x['name']} →",
+                              height=30, corner_radius=8, fg_color=ACCENT,
+                              hover_color=ACCENT_H, text_color=DARK_TXT,
+                              font=F(11, True), command=_abre_la).pack(pady=4)
+            if not outros:
+                aviso.configure(text="Nada encontrado com esse termo.")
+                return
+            self.em_segundo_plano(tarefa, pronto)
+
         def localizar(_e=None):
-            termo = termo_var.get().strip()
+            termo = ent_busca.get().strip()
             if not termo:
                 return
             if not g.get("base_path") or not os.path.isdir(g["base_path"]):
@@ -5967,9 +8146,16 @@ class App(ctk.CTk):
             est["path"] = None
             _prev_nome()
             self.em_segundo_plano(
-                lambda: buscar_pastas(g["base_path"], termo), _mostra_resultados)
+                lambda: buscar_pastas(g["base_path"], termo),
+                lambda r: _mostra_resultados(r, termo))
         ent_busca.bind("<Return>", localizar)
         btn_loc.configure(command=localizar)
+        # veio de outro grupo pelo "Abrir no grupo …": já procura
+        termo_vindo = getattr(self, "_renomear_termo", None)
+        if termo_vindo:
+            self._renomear_termo = None
+            ent_busca.insert(0, termo_vindo)
+            self.after(50, localizar)
 
         _card_job = [None]
 
@@ -6009,20 +8195,36 @@ class App(ctk.CTk):
             cards = est["cards"]
             if not cards:
                 return
-            nomes_listas = {}
-            try:
+
+            def tarefa():
+                # nomes das listas vêm da internet: fora da tela (antes a
+                # janela congelava até 10 s por card)
+                nomes_listas = {}
                 for c in cards:
                     lid = c.get("idList", "")
                     if lid and lid not in nomes_listas:
-                        nomes_listas[lid] = trello_get_list_name(
-                            lid, cfg["trello_key"], cfg["trello_token"])
-            except Exception:
-                pass
-            escolhido = dialog_selecionar_card(self, cards, nomes_listas)
-            if escolhido:
-                est["card"] = escolhido
-                card_lbl.configure(text=f"Card: {escolhido['name']}",
-                                   text_color=GREEN)
+                        try:
+                            nomes_listas[lid] = trello_get_list_name(
+                                lid, cfg["trello_key"], cfg["trello_token"])
+                        except Exception:
+                            pass
+                return nomes_listas
+
+            def pronto(nomes_listas):
+                if not card_lbl.winfo_exists():
+                    return
+                card_lbl.configure(text=f"{len(cards)} cards — clique para "
+                                        "escolher", text_color=YELLOW)
+                if isinstance(nomes_listas, dict) and "erro" in nomes_listas:
+                    nomes_listas = {}
+                escolhido = dialog_selecionar_card(self, cards, nomes_listas)
+                if escolhido:
+                    est["card"] = escolhido
+                    card_lbl.configure(text=f"Card: {escolhido['name']}",
+                                       text_color=GREEN)
+            card_lbl.configure(text="abrindo a lista de cards…",
+                               text_color=FG_DIM)
+            self.em_segundo_plano(tarefa, pronto)
 
         def _nome_mudou(*_a):
             _prev_nome()
@@ -6056,11 +8258,11 @@ class App(ctk.CTk):
                 messagebox.showerror("Renomear", str(e))
                 return
             est["path"] = novo
-            k = novo_nome.split(" - ")[0].upper()
-            self.index_data[k] = {"path": novo, "nome": novo_nome,
-                                  "cliente": nome_var.get().strip(),
-                                  "plat": g["name"].upper(), "codigo": k}
-            save_index(self.index_data)
+            indice_troca(self.index_data, antigo, novo, g["name"])
+            self._agenda_salvar_indice()
+            self._pend_cache.pop(g.get("id"), None)
+            self.registrar_desfazer(f"renomear “{atual}” → “{novo_nome}”",
+                                    lambda: desfaz_renomes([(novo, antigo)]))
             sel_lbl.configure(text=f"Renomeada: {novo_nome}\n{novo}",
                               text_color=GREEN)
             status.configure(text="✓ Pasta renomeada.", text_color=GREEN)
@@ -6074,19 +8276,28 @@ class App(ctk.CTk):
                                  text_color=YELLOW)
                 return
             codigo_pasta = atual.split(" - ")[0]
+            titulo = titulo_card(codigo_pasta, card.get("name", ""))
+            # lido AQUI, na thread da tela: variável do Tk não se lê de thread
+            mover = mover_var.get()
+            lista_aguardando = g.get("list_aguardando")
 
             def tarefa():
                 erros = []
-                try:
-                    trello_update_card_name(card["id"],
-                                            f"{codigo_pasta} - {card['name']}",
-                                            cfg["trello_key"], cfg["trello_token"])
-                except Exception as e:
-                    erros.append(f"título: {e}")
-                if mover_var.get():
-                    if g.get("list_aguardando"):
+                if titulo:
+                    try:
+                        trello_update_card_name(card["id"], titulo,
+                                                cfg["trello_key"],
+                                                cfg["trello_token"])
+                    except Exception as e:
+                        erros.append(f"título: {e}")
+                elif not _norm(card.get("name", "")).startswith(
+                        _norm(codigo_pasta)):
+                    erros.append("o card já tem outro código no título — "
+                                 "não alterei o nome dele")
+                if mover:
+                    if lista_aguardando:
                         try:
-                            trello_move_card(card["id"], g["list_aguardando"],
+                            trello_move_card(card["id"], lista_aguardando,
                                              cfg["trello_key"],
                                              cfg["trello_token"])
                         except Exception as e:
@@ -6131,6 +8342,8 @@ class App(ctk.CTk):
 
         cartoes = ctk.CTkFrame(wrap, fg_color="transparent")
         cartoes.pack(fill="x", pady=(0, 8))
+        self._alvo("rel_cartoes", cartoes)
+        self._alvo("rel_botao", btn)
 
         tabela = ctk.CTkScrollableFrame(wrap, fg_color=BG_PANEL,
                                         corner_radius=10)
@@ -6145,14 +8358,43 @@ class App(ctk.CTk):
         CORES = {"ok": GREEN, "sem_arquivo": YELLOW, "vazia": FG_DIM,
                  "nao_renomeada": "#ff9f43"}
 
-        def _cartao(titulo, valor, cor_v):
+        dados["filtro"] = None
+        molduras = {}
+
+        def _cartao(titulo, valor, cor_v, filtro=None):
+            """Card clicável: mostra só as pastas daquela situação. Clicar de
+            novo (ou em 'total') volta a mostrar tudo."""
             c = ctk.CTkFrame(cartoes, fg_color=BG_NODE, corner_radius=10,
                              border_width=1, border_color=BORDER)
             c.pack(side="left", fill="x", expand=True, padx=3)
-            ctk.CTkLabel(c, text=str(valor), text_color=cor_v,
-                         font=F(20, True)).pack(pady=(8, 0))
-            ctk.CTkLabel(c, text=titulo, text_color=FG_LABEL,
-                         font=F(10)).pack(pady=(0, 8))
+            l1 = ctk.CTkLabel(c, text=str(valor), text_color=cor_v,
+                              font=F(20, True))
+            l1.pack(pady=(8, 0))
+            l2 = ctk.CTkLabel(c, text=titulo, text_color=FG_LABEL, font=F(10))
+            l2.pack(pady=(0, 8))
+            molduras[filtro] = c
+            for w in (c, l1, l2):
+                w.configure(cursor="hand2")
+                w.bind("<Button-1>", lambda e, f=filtro: _filtra(f))
+            Tooltip(c, "Clique para ver só estas" if filtro else
+                       "Clique para ver todas")
+
+        def _pinta_cartoes():
+            for f, c in molduras.items():
+                ativo = f == dados["filtro"] or (f is None and
+                                                 dados["filtro"] is None)
+                c.configure(border_color=ACCENT if ativo else BORDER,
+                            border_width=2 if ativo else 1)
+
+        def _filtra(f):
+            dados["filtro"] = None if f == dados["filtro"] else f
+            _pinta_cartoes()
+            _desenha()
+
+        def _visiveis():
+            f = dados["filtro"]
+            return [d for d in dados["linhas"]
+                    if f is None or d.get("estado") == f]
 
         def _ordena(campo):
             atual, inv = dados["ordem"]
@@ -6163,7 +8405,7 @@ class App(ctk.CTk):
             for w in tabela.winfo_children():
                 w.destroy()
             campo, inv = dados["ordem"]
-            linhas = sorted(dados["linhas"],
+            linhas = sorted(_visiveis(),
                             key=lambda d: (str(d.get(campo, "")).lower()
                                            if not isinstance(d.get(campo), int)
                                            else d.get(campo)),
@@ -6209,7 +8451,7 @@ class App(ctk.CTk):
                     w = csv.writer(f, delimiter=";")
                     w.writerow([r for _c, r, _l in COLS])
                     campo, inv = dados["ordem"]
-                    for d in sorted(dados["linhas"],
+                    for d in sorted(_visiveis(),      # exporta o que está filtrado
                                     key=lambda x: str(x.get(campo, "")),
                                     reverse=inv):
                         w.writerow([ROT.get(d.get(c), d.get(c, ""))
@@ -6251,12 +8493,15 @@ class App(ctk.CTk):
             cont = {"ok": 0, "sem_arquivo": 0, "vazia": 0, "nao_renomeada": 0}
             for it in itens:
                 cont[it["estado"]] += 1
+            molduras.clear()
+            dados["filtro"] = None
             _cartao("total", len(itens), FG_MAIN)
-            _cartao("entregues", cont["ok"], GREEN)
-            _cartao("sem arte", cont["sem_arquivo"], YELLOW)
-            _cartao("vazias", cont["vazia"], FG_DIM)
+            _cartao("entregues", cont["ok"], GREEN, "ok")
+            _cartao("sem arte", cont["sem_arquivo"], YELLOW, "sem_arquivo")
+            _cartao("vazias", cont["vazia"], FG_DIM, "vazia")
             _cartao("não renomeadas", cont["nao_renomeada"],
-                    CORES["nao_renomeada"])
+                    CORES["nao_renomeada"], "nao_renomeada")
+            _pinta_cartoes()
             _desenha()
 
         btn.configure(command=gerar)
@@ -6291,8 +8536,8 @@ class App(ctk.CTk):
         ctk.CTkLabel(wrap, textvariable=idx_var, text_color=FG_DIM, font=F(11)
                      ).pack(anchor="w", pady=(0, 6))
 
-        busca_var = tk.StringVar()
-        ent = ctk.CTkEntry(wrap, textvariable=busca_var, height=40,
+        # sem textvariable: com ela o CTkEntry não mostra o texto de dica
+        ent = ctk.CTkEntry(wrap, height=40,
                            placeholder_text="Código ou nome do cliente...",
                            fg_color=BG_INPUT, border_color=BG_HOVER,
                            text_color=FG_MAIN, corner_radius=12, font=F(13))
@@ -6323,7 +8568,9 @@ class App(ctk.CTk):
                      font=F(11)).pack(side="right")
 
         def _buscar(*_):
-            termo = busca_var.get().strip().upper()
+            # sem ligar para acento nem maiúsculas ("joao" acha "João"),
+            # igual ao Ctrl+K e aos filtros
+            termo = _norm(ent.get().strip())
             listbox.delete(0, "end")
             resultados_paths.clear()
             count_var.set("")
@@ -6332,14 +8579,15 @@ class App(ctk.CTk):
             if not self.index_data:
                 listbox.insert("end", "  Índice vazio. Clique em 'Atualizar índice'.")
                 return
-            for cod, info in self.index_data.items():
+            for cod, info in list(self.index_data.items()):
                 # a chave pode ser composta (código + caminho) quando há
                 # nomes repetidos; a busca olha o código e o nome de verdade
-                alvo = (info.get("codigo") or cod.split("\x00")[0]).upper()
+                alvo = _norm(info.get("codigo") or cod.split("\x00")[0])
                 if (termo in alvo
-                        or termo in info.get("cliente", "").upper()
-                        or termo in info.get("nome", "").upper()):
-                    listbox.insert("end", f"  [{info['plat']}]  {info['nome']}")
+                        or termo in _norm(info.get("cliente", ""))
+                        or termo in _norm(info.get("nome", ""))):
+                    listbox.insert("end", f"  [{info.get('plat', '')}]  "
+                                          f"{info.get('nome', '')}")
                     resultados_paths.append(info["path"])
             if not resultados_paths:
                 listbox.insert("end", "  Nenhum resultado encontrado.")
@@ -6351,9 +8599,16 @@ class App(ctk.CTk):
         def _live(*_):
             if _after[0]:
                 self.after_cancel(_after[0])
-            if len(busca_var.get().strip()) >= 2:
+                _after[0] = None
+            if len(ent.get().strip()) >= 2:
                 _after[0] = self.after(300, _buscar)
-        busca_var.trace_add("write", _live)
+            else:
+                # apagou o texto: não deixa resultado velho na tela
+                listbox.delete(0, "end")
+                resultados_paths.clear()
+                count_var.set("")
+        ent.bind("<KeyRelease>", _live)
+        self._busca_campo = ent
 
         def _abrir(event=None):
             sel = listbox.curselection()
@@ -6394,6 +8649,8 @@ class App(ctk.CTk):
                     idx_var.set(f"ERRO ao indexar: {idx['erro']}")
                     return
                 self.index_data = idx
+                self.config_data["indice_em"] = time.time()
+                self.save()
                 idx_var.set(f"Índice atualizado: {len(idx)} pastas indexadas.")
             self.em_segundo_plano(tarefa, pronto, ao_progredir=progresso)
         btn_idx.configure(command=_atualizar_indice)
@@ -6728,6 +8985,16 @@ class App(ctk.CTk):
                           corner_radius=20, fg_color="transparent",
                           hover_color=BG_HOVER, text_color=RED, font=F(12, True),
                           command=excluir).pack(side="left", padx=(8, 0))
+            b_exp = ctk.CTkButton(btns, text="⤓ Exportar", width=110, height=40,
+                                  corner_radius=20, fg_color="transparent",
+                                  border_width=1, border_color=BORDER,
+                                  hover_color=BG_HOVER, text_color=FG_LABEL,
+                                  font=F(12),
+                                  command=lambda: self.exportar_grupo(
+                                      data, parent=win))
+            b_exp.pack(side="left", padx=(8, 0))
+            Tooltip(b_exp, "Salva este grupo (modelo, padrões, cor) num arquivo\n"
+                           ".json para importar em outro PC da equipe.")
 
     # ═════════════════════════════════════════════════════════════════════════
     # AJUDA (sintaxe do modelo)
@@ -6858,28 +9125,51 @@ EXEMPLO COMPLETO
         _refresh()
 
     def _watcher_log(self, msg, tag="dim"):
+        """Pode ser chamado da thread do watcher: só enfileira. Quem escreve
+        na tela (e mexe no índice) é a thread principal, em _watcher_drena."""
         line = f"[{datetime.datetime.now():%H:%M:%S}] {msg}"
-        self._watcher_lines.append((line, tag))
-        del self._watcher_lines[:-500]
-        tb = self._watcher_tb
-        if tb is not None:
-            def _do():
+        self._watcher_fila.put(("log", line, tag))
+        # chamado da própria thread da tela (iniciar/parar): drena na hora
+        if threading.current_thread() is threading.main_thread():
+            self._watcher_garante_dreno()
+
+    def _watcher_garante_dreno(self):
+        if self._watcher_job is None:
+            self._watcher_job = self.after(200, self._watcher_drena)
+
+    def _watcher_drena(self):
+        self._watcher_job = None
+        while True:
+            try:
+                item = self._watcher_fila.get_nowait()
+            except queue.Empty:
+                break
+            if item[0] == "log":
+                _t, line, tag = item
+                self._watcher_lines.append((line, tag))
+                del self._watcher_lines[:-500]
+                tb = self._watcher_tb
                 try:
-                    if tb.winfo_exists():
+                    if tb is not None and tb.winfo_exists():
                         tb_write(tb, line, tag, timestamp=False)
                 except Exception:
                     pass
-            try:
-                self.after(0, _do)
-            except Exception:
-                pass
+            elif item[0] == "renomeada":
+                _t, antigo, novo, grupo_nome = item
+                indice_troca(self.index_data, antigo, novo, grupo_nome)
+                self._agenda_salvar_indice()
+                self._pend_cache.clear()
+        if self.watcher_active or not self._watcher_fila.empty():
+            self._watcher_job = self.after(300, self._watcher_drena)
 
     def _start_watcher(self):
         if self.watcher_active:
             return
         self.watcher_active = True
         self._watcher_processed.clear()
+        self._watcher_pendentes.clear()
         self._watcher_log("Watcher iniciado.", "ok")
+        self._watcher_garante_dreno()
 
         def loop():
             while self.watcher_active:
@@ -6920,40 +9210,129 @@ EXEMPLO COMPLETO
                 card_id, card_name = card["id"], card.get("name", "")
                 if card_id in self._watcher_processed:
                     continue
+                espera = self._watcher_pendentes.get(card_id)
+                agora = time.time()
+                if espera and agora < espera[1]:
+                    continue
                 m = codigo_re_do_grupo(g).match(card_name)
                 if not m:
                     continue
                 code = m.group(1)
-                vazio_name = f"{code} - Vazio"
-                found_path = None
-                if os.path.exists(base_path):
-                    for root, dirs, _ in os.walk(base_path):
-                        for d in dirs:
-                            if d.upper() == vazio_name.upper():
-                                found_path = os.path.join(root, d)
-                                break
-                        if found_path:
-                            break
-                if found_path:
-                    try:
-                        novo_path = os.path.join(os.path.dirname(found_path),
-                                                 card_name)
-                        os.rename(found_path, novo_path)
-                        self._watcher_log(
-                            f"[{g['name']}] Renomeado: {vazio_name} → {card_name}",
-                            "ok")
+                prov, renomeada = self._watcher_acha_pasta(g, code)
+                if not prov and not renomeada and not espera:
+                    # 1ª vez: varre a base inteira, como a v1.1.0 fazia
+                    prov, renomeada = self._watcher_varre(g, code)
+                tag_g = f"[{g['name']}]"
+                if prov:
+                    novo_nome = _sanitiza_nome(card_name)
+                    if not novo_nome:
                         self._watcher_processed.add(card_id)
-                        self.index_data[code] = {
-                            "path": novo_path, "nome": card_name,
-                            "cliente": m.group(2), "plat": g["name"].upper(),
-                        }
-                        save_index(self.index_data)
-                    except Exception as e:
-                        self._watcher_log(
-                            f"[{g['name']}] Erro ao renomear {vazio_name}: {e}",
-                            "erro")
-                else:
+                        continue
+                    novo_path = os.path.join(os.path.dirname(prov), novo_nome)
+                    if os.path.normcase(novo_path) != os.path.normcase(prov) \
+                            and os.path.exists(novo_path):
+                        self._watcher_log(f"{tag_g} Já existe '{novo_nome}' — "
+                                          "não renomeei.", "erro")
+                        self._watcher_processed.add(card_id)
+                        continue
+                    try:
+                        os.rename(prov, novo_path)
+                    except OSError as e:
+                        n = (espera[0] + 1) if espera else 1
+                        self._watcher_log(f"{tag_g} Erro ao renomear "
+                                          f"{os.path.basename(prov)}: {e}"
+                                          + (" — tento de novo em 5 min"
+                                             if n <= 12 else ""), "erro")
+                        if n > 12:
+                            self._watcher_processed.add(card_id)
+                        else:
+                            self._watcher_pendentes[card_id] = (n, agora + 300)
+                        continue
+                    extra = ("" if novo_nome == card_name else
+                             "  (tirei do nome caracteres que o Windows não aceita)")
+                    self._watcher_log(f"{tag_g} Renomeado: {os.path.basename(prov)}"
+                                      f" → {novo_nome}{extra}", "ok")
                     self._watcher_processed.add(card_id)
+                    self._watcher_pendentes.pop(card_id, None)
+                    self._watcher_fila.put(("renomeada", prov, novo_path,
+                                            g["name"]))
+                elif renomeada:
+                    # a pasta desse código já tem nome definitivo
+                    self._watcher_processed.add(card_id)
+                    self._watcher_pendentes.pop(card_id, None)
+                else:
+                    # a pasta ainda não chegou neste PC (OneDrive atrasado?):
+                    # antes o card era esquecido na hora; agora tenta por 1h
+                    n = (espera[0] + 1) if espera else 1
+                    if n > 12:
+                        self._watcher_processed.add(card_id)
+                        self._watcher_pendentes.pop(card_id, None)
+                        self._watcher_log(f"{tag_g} A pasta {code} não apareceu "
+                                          "em 1 hora — desisti deste card.",
+                                          "erro")
+                    else:
+                        self._watcher_pendentes[card_id] = (n, agora + 300)
+                        if n == 1:
+                            self._watcher_log(f"{tag_g} Pasta {code} ainda não "
+                                              "existe neste PC — tento de novo "
+                                              "a cada 5 min.", "dim")
+
+    @staticmethod
+    def _watcher_procura(nomes, pai, code, provs):
+        """(pasta_provisória, pasta_já_renomeada) entre os nomes de `pai`."""
+        renomeada = None
+        for d in nomes:
+            if " - " not in d:
+                continue
+            c, resto = d.split(" - ", 1)
+            if c.strip().upper() != code:
+                continue
+            if _norm(resto).strip() in provs:
+                return os.path.join(pai, d), None
+            renomeada = os.path.join(pai, d)
+        return None, renomeada
+
+    def _watcher_provs(self, g):
+        return {_norm(p).strip()
+                for p in (g.get("provisorios") or PROVISORIOS_PADRAO)}
+
+    def _watcher_acha_pasta(self, g, code):
+        """Olha direto a pasta do mês do código (este ano e o anterior), sem
+        varrer a base — é o que permite tentar de novo a cada 5 min."""
+        code = code.upper()
+        pref = (g.get("prefix") or "").upper()
+        cod = code[len(pref):] if pref and code.startswith(pref) else code
+        if not (len(cod) >= 2 and cod[:2].isdigit() and 1 <= int(cod[:2]) <= 12):
+            return None, None
+        ano = datetime.datetime.now().year
+        vistos = set()
+        for a in (ano, ano - 1):
+            pai = mp_destino(g, str(a), MESES[int(cod[:2]) - 1])
+            if not pai or pai in vistos:
+                continue
+            vistos.add(pai)
+            try:
+                nomes = [e.name for e in os.scandir(pai) if e.is_dir()]
+            except OSError:
+                continue
+            achou = self._watcher_procura(nomes, pai, code, self._watcher_provs(g))
+            if achou[0] or achou[1]:
+                return achou
+        return None, None
+
+    def _watcher_varre(self, g, code):
+        base = g.get("base_path", "")
+        if not base or not os.path.exists(base):
+            return None, None
+        code, provs = code.upper(), self._watcher_provs(g)
+        re_cod = codigo_re_do_grupo(g)
+        for root, dirs, _ in os.walk(base):
+            dirs[:] = [d for d in dirs if not d.startswith("#")]
+            achou = self._watcher_procura(dirs, root, code, provs)
+            if achou[0] or achou[1]:
+                return achou
+            dirs[:] = [d for d in dirs if not re_cod.match(d)]
+        return None, None
 
     # ═════════════════════════════════════════════════════════════════════════
     # CONFIGURAÇÕES GLOBAIS

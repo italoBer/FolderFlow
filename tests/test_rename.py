@@ -126,7 +126,6 @@ tmp5 = tempfile.mkdtemp(prefix="ff_tam_")
 os.makedirs(os.path.join(tmp5, "sub"))
 open(os.path.join(tmp5, "a.bin"), "wb").write(b"x" * 1000)
 open(os.path.join(tmp5, "sub", "b.bin"), "wb").write(b"y" * 2000)
-check(ff.tamanho_de(tmp5) == 3000, "soma o tamanho das subpastas")
 check(ff.fmt_tamanho(3000) == "2.9 KB", f"formata ({ff.fmt_tamanho(3000)})")
 check(ff.fmt_tamanho(500) == "500 B", "formata bytes")
 

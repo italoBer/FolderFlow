@@ -155,8 +155,16 @@ check(b_corr and b_corr[0].cget("state") == "normal",
 check("(2)" in str(b_corr[0].cget("text")),
       f"mostra quantas pendências ({b_corr[0].cget('text')})")
 
-# corrige todas
+# corrige todas: abre a revisão, depois aplica
 b_corr[0].invoke()
+pump(0.6)
+rev = [w for w in app.winfo_children() if isinstance(w, ctk.CTkToplevel)][-1]
+b_ap = [b for b in todos(rev, ctk.CTkButton) if "Aplicar" in str(b.cget("text"))]
+check(b_ap and "Aplicar 2 correções" in b_ap[0].cget("text"),
+      f"revisão lista as 2 antes de aplicar ({b_ap[0].cget('text')})")
+check(os.path.isdir(os.path.join(destino, f"{mn}0003AB - Vazio")),
+      "nada é renomeado antes de aplicar")
+b_ap[0].invoke()
 pump(1.5)
 nomes_disco = os.listdir(destino)
 print("      pastas após corrigir:", nomes_disco)

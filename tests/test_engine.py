@@ -129,10 +129,12 @@ os.rename(os.path.join(destino, "090001IT - Vazio"),
           os.path.join(destino, "090001IT - Cliente Teste"))
 open(os.path.join(destino, "090001IT - Cliente Teste", "#ENVIAR", "arte.pdf"),
      "w").close()
-r = ff.gerar_relatorio(g, "2026", "09 - SETEMBRO")
-check(r["total"] == 6 and r["com_cliente"] == 1 and r["com_arquivo"] == 1,
-      f"relatório: total={r['total']} com_cliente={r['com_cliente']} com_arquivo={r['com_arquivo']}")
-check(r["por_pessoa"].get("IT") == 4 and r["por_pessoa"].get("AB") == 2,
+r = ff.conferir_pastas(g, "2026", "09 - SETEMBRO")
+estados = [it["estado"] for it in r["itens"]]
+check(len(estados) == 6 and estados.count("ok") == 1
+      and estados.count("vazia") == 5,
+      f"relatório: {len(estados)} pastas, entregue={estados.count('ok')}")
+check(r["por_pessoa"]["IT"]["total"] == 4 and r["por_pessoa"]["AB"]["total"] == 2,
       "relatório: contagem por responsável")
 
 # ── 7. Migração v1 → v2 ──────────────────────────────────────────────────────
@@ -166,8 +168,10 @@ check("090001IT" in idx and idx["090001IT"]["cliente"] == "Cliente Teste",
       "índice: pasta renomeada indexada")
 check("A090001IT" in idx and idx["A090001IT"]["plat"] == "MERCADO LIVRE",
       "índice: grupo ML rotulado")
-path, nome = ff.buscar_pasta_por_codigo([mp_base], "090001IT")
-check(nome == "090001IT - Cliente Teste", "busca por código")
+achados = ff.buscar_pastas(mp_base, "090001IT")
+check(achados and os.path.basename(achados[0]) == "090001IT - Cliente Teste",
+      "busca por código")
+check(not any("#ENVIAR" in k for k in idx), "índice não guarda as pastas #ENVIAR")
 
 shutil.rmtree(tmp)
 print(f"\n{ok_count} verificações passaram. TUDO OK")

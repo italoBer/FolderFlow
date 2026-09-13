@@ -143,6 +143,9 @@ check(any(e.get() == "Padaria Central" for e in todos(aba, ctk.CTkEntry)),
       "sugere 'Padaria Central' pelo .cdr da 'vazio 0002'")
 b_corr = [b for b in todos(aba, ctk.CTkButton) if "Corrigir todas" in str(b.cget("text"))]
 b_corr[0].invoke()
+pump(0.6)
+rev = [w for w in app.winfo_children() if isinstance(w, ctk.CTkToplevel)][-1]
+[b for b in todos(rev, ctk.CTkButton) if "Aplicar" in str(b.cget("text"))][0].invoke()
 pump(0.8)
 check(os.path.isdir(os.path.join(base_t, "0002 - Padaria Central")),
       "corrigiu para '0002 - Padaria Central'")
