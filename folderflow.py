@@ -853,7 +853,7 @@ def _molde(nome):
         s, e = md.start(), md.end()
         if any(a <= s < b for a, b, _t in spans):
             continue
-        antes, depois = n[:s], n[e:]
+        depois = n[e:]
         colado_nome = mm is not None and (
             (0 <= mm.start() - e <= 4 and not re.search(r"[A-Z0-9]",
                                                          n[e:mm.start()]))
@@ -3968,7 +3968,7 @@ class App(ctk.CTk):
                 passo[0] += 1
                 _desenha()
             else:
-                _finaliza(win, resp)
+                self._finaliza(win, resp)
 
         def _volta():
             if passo[0] > 0:
